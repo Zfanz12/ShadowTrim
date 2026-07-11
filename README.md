@@ -1,6 +1,6 @@
 # ShadowTrim
 
-**ShadowTrim** (ShadowClip) is a Flutter-based desktop video trimmer built for speed and quality. Using **lossless trimming** (stream copy) via FFmpeg, ShadowTrim cuts videos without any re-encoding — the result is fast, with zero quality loss.
+**ShadowTrim** (ShadowClip) is a Flutter-based desktop video trimmer built for speed and quality. Using stream copy via FFmpeg, ShadowTrim cuts videos without any re-encoding or re-render. the result is fast, with zero quality loss.
 
 It's perfect for quickly trimming multiple clips (gameplay highlights, OBS recordings, raw footage, etc.) without having to open a heavy video editing suite.
 
