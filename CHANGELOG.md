@@ -2,16 +2,35 @@
 All notable changes to ShadowTrim will be documented in this file.
 
 ## Upcoming Fixes & Features
-- **Simplified Default Sorting** — Default clip sorting will switch to Date Created only, replacing the current four-way sort with two direct options: Newest and Oldest.
-- **Playback Speed Control** — Added a speed selector (1x, 1.5x, 2x, 3x) placed next to the volume control, adjustable via `Shift + ,` (`<`) and `Shift + .` (`>`). Stepping is non-cyclic and stops at the minimum/maximum speed.
+
+### Bug Fixes & Performance Enhancements
+- **Resolve List Scrolling Lag** — Fix a performance issue where scrolling down the video list accidentally loads all videos simultaneously, causing the application to lag. Implement lazy loading or optimized rendering.
+- **Duplicate Filename Handling** — Implement a safeguard for duplicate file names. If a name already exists, either prompt a rename popup or automatically append a sequence number (e.g., "filename (2)").
+
+### New Features & Core Logic
+- **Recycle Bin Integration** — Ensure deleted files are moved to the system Recycle Bin rather than being permanently deleted.
+- **Session Memory Management** — Implement a tracking system (e.g., saving a blacklist file of trimmed video names) so that previously trimmed videos do not reappear in the active list, even if the "Delete file after trim" option is unchecked.
+- **Session Save Prompt** — Add a confirmation dialog when closing the application with an active session, offering three options: "Save," "Delete this session," and "Cancel."
+- **Playback Speed Control** — Added a speed selector (1x, 1.5x, 2x, 3x) placed next to the volume control.
+- **"Delete Original Clip" Checkbox** — Added an optional checkbox in the export panel to delete the source file after a successful trim. Unchecked by default, and highlighted in red when checked as a visual warning.
+
+### Quality of Life (QoL) & UI/UX Improvements
+- **Simplified Default Sorting** — Default clip sorting will switch to Date Created, with drop-down options for Newest and Oldest.
+- **Auto-Advance on Trim** — Automatically proceed to the next video in the list immediately after the user presses `Enter` to execute a trim.
+- **Auto-Scroll Video List** — The left sidebar video list automatically scrolls as the user navigates, keeping the currently selected video visible on screen.
+- **Accurate "Show in Folder" Routing** — Ensure the "Show in Folder" icon for trimmed clips directs the user to the newly generated file rather than the original video.
+- **Improved Delete Button Visibility** — The "Delete" label in the delete confirmation dialog will change from faint red to solid white for better readability.
+- **Success Notification Styling** — Change the "Clip deleted successfully" toast/popup notification at the bottom of the screen to red instead of green.
+- **Quick Jump to Start Point** — Added a `Shift + J` shortcut, along with a corresponding on-screen button (placed next to the 5-second seek-backward control), to jump the playhead directly to the clip's Start Cut point.
+
+### Keyboard Shortcuts & Navigation
+- **Playback Speed Shortcuts** — `Shift + ,` (`<`) and `Shift + .` (`>`) adjust playback speed. Stepping is non-cyclic (absolute adjustments) and stops at the minimum/maximum speed.
 - **Renamed Percentage-Jump Shortcuts** — The playhead jump shortcuts for 25% / 50% / 75% will change from `1 / 2 / 3` to `I / O / P`.
 - **Jump to Beginning/End Shortcuts** — `Shift + I` will jump the playhead to the beginning of the video, and `Shift + P` will jump to the end.
-- **Mute Toggle Shortcut** — Added `M` as a shortcut to toggle mute/unmute.
 - **Volume Adjustment Shortcut** — `Shift + Arrow Up` / `Shift + Arrow Down` will raise/lower the volume, where supported.
-- **Improved Delete Button Visibility** — The "Delete" label in the delete confirmation dialog will change from faint red to solid white for better readability.
+- **Mute Toggle Shortcut** — Added `M` as a shortcut to toggle mute/unmute.
 - **Delete Shortcut & Popup Controls** — Pressing `Del` will open the delete confirmation dialog for the selected clip; inside the dialog, `Enter` confirms the deletion and `Esc` cancels it.
-- **"Delete Original Clip" Checkbox** — Added an optional checkbox in the export panel to delete the source file after a successful trim. Unchecked by default, and highlighted in red when checked as a visual warning.
-- **Quick Jump to Start Point** — Added a `Shift + J` shortcut, along with a corresponding on-screen button (placed next to the 5-second seek-backward control), to jump the playhead directly to the clip's Start Cut point.
+- **Rename Flow (`F2`)** — Map `F2` to rename the file, automatically focusing the text field so the user can type immediately without a mouse click. Pressing `Enter` saves the new name and safely returns keyboard focus to the main interface, ensuring it doesn't conflict with the `Enter` shortcut used for trimming.
 
 # Releases
 
