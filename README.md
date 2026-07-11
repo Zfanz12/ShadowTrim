@@ -38,23 +38,12 @@ It's perfect for quickly trimming multiple clips (gameplay highlights, OBS recor
 
 ---
 
-## Prerequisites
+## Dependencies
 
 Before running this app, make sure you have:
-
-1. **Flutter SDK** (stable channel, latest version recommended) — [installation guide](https://docs.flutter.dev/get-started/install)
-2. **Flutter desktop support** enabled for your target platform:
-   ```bash
-   flutter config --enable-windows-desktop
-   flutter config --enable-macos-desktop
-   flutter config --enable-linux-desktop
-   ```
-3. **FFmpeg** installed on your system and available on the `PATH`. Verify with:
-   ```bash
-   ffmpeg -version
-   ```
-   If it's not installed, download it from [ffmpeg.org/download.html](https://ffmpeg.org/download.html) or install it via a package manager (`choco install ffmpeg`, `brew install ffmpeg`, `sudo apt install ffmpeg`, etc.).
-
+1. **Flutter SDK**
+2. **Flutter desktop support**
+3. **FFmpeg** 
 > **Important:** This app **will not work** without FFmpeg installed, since the entire video-trimming process relies entirely on the `ffmpeg` binary being called from the system.
 
 ---
@@ -132,42 +121,11 @@ flutter build linux     # produces a binary in build/linux/x64/release/bundle
 
 ---
 
-## Project Structure
-
-```
-lib/
-├── main.dart                  # App entry point & global theme
-├── models/
-│   └── clip_model.dart        # VideoClip data model (path, size, duration, cut points, etc.)
-├── services/
-│   └── video_service.dart     # FFmpeg-based lossless trimming logic & metadata restoration
-└── screens/
-    ├── dashboard_screen.dart   # Main screen (multi-clip workspace, player, export panel)
-    ├── home_screen.dart        # Simple landing screen (single-clip drag & drop)
-    └── trimmer_screen.dart     # Simple trim screen for the single-clip flow
-```
-
-> Note: `dashboard_screen.dart` is the app's primary workflow (multi-clip, sidebar, full export settings) launched directly from `main.dart`. `home_screen.dart` and `trimmer_screen.dart` provide a simpler alternative flow for single-clip use.
-
----
-
 ## Notes & Limitations
 
 - Because it uses `-c copy` mode (no re-encoding), FFmpeg **snaps cut points to the nearest keyframe**. This is normal for lossless trimming and is the trade-off for fast processing without quality loss.
 - The "preserve creation time" feature on Windows requires PowerShell, which is available by default on the system.
 - Native drag & drop and file picker only work on **desktop** targets (Windows/macOS/Linux) — web/mobile are not supported yet.
-
----
-
-## Contributing
-
-Pull requests are very welcome! For major changes, please open an issue first to discuss what you'd like to change.
-
-1. Fork this repository
-2. Create a new branch (`git checkout -b new-feature`)
-3. Commit your changes (`git commit -m 'Add new feature'`)
-4. Push to the branch (`git push origin new-feature`)
-5. Open a Pull Request
 
 ---
 
