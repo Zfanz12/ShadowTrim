@@ -21,8 +21,6 @@ It's perfect for quickly trimming multiple clips (gameplay highlights, OBS recor
 - **Thumbnail Preview** — Every clip in the list shows an automatically generated thumbnail.
 - **Delete Clip** — Delete a file directly from disk with a safety confirmation dialog.
 - **Keyboard Controls** — Full navigation and playback control without needing a mouse.
-- **Modern Dark UI** — A custom dark theme with an "Nvidia Green" accent.
-
 ---
 
 ## Tech Stack
