@@ -3,7 +3,8 @@ import 'package:path/path.dart' as path;
 
 class VideoClip {
   final String filePath;
-  final String fileName;
+  String fileName;
+  final String originalFileName;
   final int fileSizeBytes;
   Duration duration;
   Duration startCut;
@@ -12,12 +13,15 @@ class VideoClip {
   int? fps;
   bool isTrimmed;
   bool isAnimating;
+  bool isOriginalDeleted;
   final DateTime dateModified;
   final DateTime dateCreated;
+  String? trimmedOutputPath;
 
   VideoClip({
     required this.filePath,
     required this.fileName,
+    required this.originalFileName,
     required this.fileSizeBytes,
     required this.dateModified,
     required this.dateCreated,
@@ -28,6 +32,8 @@ class VideoClip {
     this.fps,
     this.isTrimmed = false,
     this.isAnimating = false,
+    this.isOriginalDeleted = false,
+    this.trimmedOutputPath,
   });
 
   String get fileSizeFormatted {
@@ -51,6 +57,7 @@ class VideoClip {
     return VideoClip(
       filePath: filePath,
       fileName: name,
+      originalFileName: name,
       fileSizeBytes: size,
       dateModified: dateModified,
       dateCreated: dateCreated,

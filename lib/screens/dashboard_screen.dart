@@ -1,4 +1,6 @@
 import 'dart:io';
+import 'dart:convert';
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
@@ -6,6 +8,7 @@ import 'package:desktop_drop/desktop_drop.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:path/path.dart' as path;
+import 'package:path_provider/path_provider.dart';
 import '../models/clip_model.dart';
 import '../services/video_service.dart';
 
@@ -16,9 +19,13 @@ class DashboardScreen extends StatefulWidget {
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> {
+class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingObserver {
   // Tabs
   bool _isFolderMode = false;
+  bool _deleteOriginalAfterTrim = false;
+  bool _viewingTrimmedMode = false;
+  final Set<String> _blacklistedClipNames = {};
+  final Set<String> _originalClipsToDelete = {};
 
   // State
   List<VideoClip> _clips = [];
@@ -29,6 +36,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   late final VideoController _controller;
   Duration _currentPosition = Duration.zero;
   late final FocusNode _focusNode;
+  late final FocusNode _exportNameFocusNode;
 
   // Export Settings
   final TextEditingController _exportNameController = TextEditingController();
@@ -39,20 +47,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
   bool _autoCreateTrimmedFolder = true;
   String? _currentWorkspacePath;
 
-  // Drag and drop state
   bool _isDragging = false;
   bool _untrimmedExpanded = true;
   bool _trimmedExpanded = true;
-  String _sortBy = 'name'; // 'name', 'size', 'modified', 'created'
+  String _sortBy = 'created_desc'; // 'created_desc', 'created_asc'
   double _volume = 100.0;
   double _lastVolume = 100.0;
+  double _playbackSpeed = 1.0;
   double? _draggingPositionMs;
   DateTime? _lastSeekTime;
+  final Map<VideoClip, GlobalKey> _clipKeys = {};
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _focusNode = FocusNode();
+    _exportNameFocusNode = FocusNode();
     _player = Player();
     _controller = VideoController(_player);
 
@@ -90,22 +101,48 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _player.dispose();
     _exportNameController.dispose();
     _focusNode.dispose();
+    _exportNameFocusNode.dispose();
     super.dispose();
   }
 
   // Load a video clip into the player
-  void _selectClip(int index) {
+  void _selectClip(int index, {bool forceOriginal = false}) {
     if (index < 0 || index >= _clips.length) return;
+    final clip = _clips[index];
     setState(() {
       _selectedClipIndex = index;
-      final clip = _clips[index];
-      _exportNameController.text = path.basenameWithoutExtension(clip.fileName) + '_cut';
+      if (clip.isTrimmed) {
+        _exportNameController.text = path.basenameWithoutExtension(clip.fileName);
+      } else {
+        _exportNameController.text = path.basenameWithoutExtension(clip.fileName) + '_cut';
+      }
+      if (forceOriginal) {
+        _viewingTrimmedMode = false;
+      } else {
+        _viewingTrimmedMode = clip.isTrimmed;
+      }
     });
 
-    _player.open(Media(_clips[index].filePath), play: false);
+    final loadPath = _viewingTrimmedMode ? (clip.trimmedOutputPath ?? clip.filePath) : clip.filePath;
+    _player.open(Media(loadPath), play: false);
+    _player.setRate(_playbackSpeed);
+
+    // Auto-scroll to keep the selected clip visible on screen
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final clip = _clips[index];
+      final key = _clipKeys[clip];
+      if (key != null && key.currentContext != null) {
+        Scrollable.ensureVisible(
+          key.currentContext!,
+          duration: const Duration(milliseconds: 300),
+          alignment: 0.5, // Align to middle of viewport
+        );
+      }
+    });
   }
 
   void _sortClips() {
@@ -115,17 +152,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
 
     switch (_sortBy) {
-      case 'name':
-        _clips.sort((a, b) => a.fileName.toLowerCase().compareTo(b.fileName.toLowerCase()));
-        break;
-      case 'size':
-        _clips.sort((a, b) => b.fileSizeBytes.compareTo(a.fileSizeBytes));
-        break;
-      case 'modified':
-        _clips.sort((a, b) => b.dateModified.compareTo(a.dateModified));
-        break;
-      case 'created':
+      case 'created_desc':
         _clips.sort((a, b) => b.dateCreated.compareTo(a.dateCreated));
+        break;
+      case 'created_asc':
+        _clips.sort((a, b) => a.dateCreated.compareTo(b.dateCreated));
         break;
     }
 
@@ -156,6 +187,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
       );
 
       if (result != null && result.files.isNotEmpty) {
+        final firstPath = result.files.first.path;
+        if (firstPath != null) {
+          _currentWorkspacePath = path.dirname(firstPath);
+          await _loadSessionBlacklist();
+        }
+
         List<VideoClip> newClips = [];
         for (var file in result.files) {
           if (file.path != null) {
@@ -169,12 +206,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
           _selectedClipIndex = -1;
           _clips.addAll(newClips);
           _sortClips();
-          if (newClips.isNotEmpty) {
-            _currentWorkspacePath = path.dirname(newClips.first.filePath);
-          }
-          if (_clips.isNotEmpty) {
-            _selectClip(0);
-          }
+        });
+        await _restoreSessionData();
+        setState(() {
+          _sortClips();
+          if (_clips.isNotEmpty) _selectClip(0);
         });
       }
     } catch (e) {
@@ -188,6 +224,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
       String? directoryPath = await FilePicker.platform.getDirectoryPath();
 
       if (directoryPath != null) {
+        _currentWorkspacePath = directoryPath;
+        await _loadSessionBlacklist();
+
         final dir = Directory(directoryPath);
         final List<FileSystemEntity> entities = await dir.list().toList();
         
@@ -212,10 +251,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
           _selectedClipIndex = -1;
           _clips.addAll(newClips);
           _sortClips();
-          _currentWorkspacePath = directoryPath;
-          if (_clips.isNotEmpty) {
-            _selectClip(0);
-          }
+        });
+        await _restoreSessionData();
+        setState(() {
+          _sortClips();
+          if (_clips.isNotEmpty) _selectClip(0);
         });
       }
     } catch (e) {
@@ -224,6 +264,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   void _handleDroppedFiles(List<String> filePaths) async {
+    if (filePaths.isNotEmpty) {
+      _currentWorkspacePath = path.dirname(filePaths.first);
+      await _loadSessionBlacklist();
+    }
+
     List<VideoClip> newClips = [];
     for (var filePath in filePaths) {
       final ext = path.extension(filePath).toLowerCase();
@@ -239,10 +284,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _selectedClipIndex = -1;
         _clips.addAll(newClips);
         _sortClips();
-        _currentWorkspacePath = path.dirname(newClips.first.filePath);
-        if (_clips.isNotEmpty) {
-          _selectClip(0);
-        }
+      });
+      await _restoreSessionData();
+      setState(() {
+        _sortClips();
+        if (_clips.isNotEmpty) _selectClip(0);
       });
     } else {
       _showSnackBar('No valid video files dropped.', isError: true);
@@ -283,13 +329,467 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return "${twoDigits(duration.inHours)}:$twoDigitMinutes:$twoDigitSeconds.$milliseconds";
   }
 
-  void _showSnackBar(String message, {bool isError = false}) {
+  void _showSnackBar(String message, {bool isError = false, bool isDelete = false}) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(message),
-        backgroundColor: isError ? Colors.red : Colors.green,
+        content: Text(
+          message,
+          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+        ),
+        backgroundColor: (isError || isDelete) ? Colors.red.shade800 : Colors.green.shade800,
       ),
     );
+  }
+
+  void _toggleMute() {
+    setState(() {
+      if (_volume > 0) {
+        _lastVolume = _volume;
+        _volume = 0;
+      } else {
+        _volume = _lastVolume > 0 ? _lastVolume : 100;
+      }
+      _player.setVolume(_volume);
+    });
+  }
+
+  void _changeSpeed(bool increase) {
+    final List<double> speeds = [1.0, 1.5, 2.0, 3.0];
+    int index = speeds.indexOf(_playbackSpeed);
+    if (index == -1) index = 0;
+
+    if (increase) {
+      if (index < speeds.length - 1) {
+        index++;
+      }
+    } else {
+      if (index > 0) {
+        index--;
+      }
+    }
+
+    setState(() {
+      _playbackSpeed = speeds[index];
+    });
+    _player.setRate(speeds[index]);
+  }
+
+  Future<void> _deleteToRecycleBin(String filePath) async {
+    try {
+      final escapedPath = filePath.replaceAll('"', '`"');
+      final cmd = 'Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile("$escapedPath", "OnlyErrorDialogs", "SendToRecycleBin")';
+      final res = await Process.run('powershell', ['-NoProfile', '-NonInteractive', '-Command', cmd]);
+      if (res.exitCode != 0) {
+        final file = File(filePath);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      }
+    } catch (e) {
+      final file = File(filePath);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    }
+  }
+
+  Future<File> _getBlacklistFile() async {
+    if (_currentWorkspacePath != null) {
+      return File(path.join(_currentWorkspacePath!, '.shadowtrim_blacklist.json'));
+    }
+    final docDir = await getApplicationDocumentsDirectory();
+    return File(path.join(docDir.path, 'shadowtrim_global_blacklist.json'));
+  }
+
+  Future<void> _saveSessionBlacklist() async {
+    try {
+      final file = await _getBlacklistFile();
+      final jsonString = jsonEncode(_blacklistedClipNames.toList());
+      await file.writeAsString(jsonString);
+    } catch (e) {
+      debugPrint('Failed to save blacklist: $e');
+    }
+  }
+
+  Future<void> _deleteSessionBlacklist() async {
+    try {
+      final file = await _getBlacklistFile();
+      if (await file.exists()) {
+        await file.delete();
+      }
+      setState(() {
+        _blacklistedClipNames.clear();
+      });
+    } catch (e) {
+      debugPrint('Failed to delete blacklist: $e');
+    }
+  }
+
+  Future<void> _loadSessionBlacklist() async {
+    try {
+      final file = await _getBlacklistFile();
+      if (await file.exists()) {
+        final content = await file.readAsString();
+        final List<dynamic> list = jsonDecode(content);
+        setState(() {
+          _blacklistedClipNames.clear();
+          _blacklistedClipNames.addAll(list.cast<String>());
+        });
+      }
+    } catch (e) {
+      debugPrint('Failed to load blacklist: $e');
+    }
+  }
+
+  Future<String?> _showSessionSavePrompt() async {
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      barrierColor: Colors.black.withOpacity(0.8),
+      builder: (ctx) => Focus(
+        autofocus: true,
+        onKeyEvent: (node, event) {
+          if (event is KeyDownEvent) {
+            if (event.logicalKey == LogicalKeyboardKey.escape) {
+              Navigator.pop(ctx, 'cancel');
+              return KeyEventResult.handled;
+            }
+          }
+          return KeyEventResult.ignored;
+        },
+        child: Dialog(
+          backgroundColor: Colors.transparent,
+          child: Container(
+            width: 400,
+            decoration: BoxDecoration(
+              color: const Color(0xFF11111B),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFF76B900).withOpacity(0.35), width: 1),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Header
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                  decoration: const BoxDecoration(
+                    color: Color(0xFF0F1E15),
+                    borderRadius: BorderRadius.only(topLeft: Radius.circular(9), topRight: Radius.circular(9)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.save_outlined, color: Color(0xFF76B900), size: 18),
+                      const SizedBox(width: 8),
+                      const Text('Save Session?', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 0.3)),
+                      const Spacer(),
+                      GestureDetector(
+                        onTap: () => Navigator.pop(ctx, 'cancel'),
+                        child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                      ),
+                    ],
+                  ),
+                ),
+                // Content
+                const Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'You have active items in this session.',
+                        style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
+                      ),
+                      SizedBox(height: 8),
+                      Text(
+                        'Do you want to save the session? Saving will remember previously trimmed clips so they do not reappear next time.',
+                        style: TextStyle(color: Colors.grey, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+                // Actions
+                Container(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => Navigator.pop(ctx, 'cancel'),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.white70,
+                            side: const BorderSide(color: Color(0xFF2E2E3E)),
+                            padding: const EdgeInsets.symmetric(vertical: 11),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                          ),
+                          child: const Text('Cancel', style: TextStyle(fontSize: 11)),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: () => Navigator.pop(ctx, 'delete'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.red.shade900,
+                            foregroundColor: Colors.white,
+                            elevation: 0,
+                            padding: const EdgeInsets.symmetric(vertical: 11),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(6),
+                              side: BorderSide(color: Colors.redAccent.withOpacity(0.5)),
+                            ),
+                          ),
+                          child: const Text('End This Session', style: TextStyle(fontSize: 11)),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: () => Navigator.pop(ctx, 'save'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF76B900),
+                            foregroundColor: Colors.white,
+                            elevation: 0,
+                            padding: const EdgeInsets.symmetric(vertical: 11),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(6),
+                              side: BorderSide(color: const Color(0xFF76B900).withOpacity(0.5)),
+                            ),
+                          ),
+                          child: const Text('Save', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _deleteQueuedOriginalFiles() async {
+    for (final filePath in _originalClipsToDelete) {
+      await _deleteToRecycleBin(filePath);
+    }
+    _originalClipsToDelete.clear();
+  }
+
+  // ── Full Session Persistence ──────────────────────────────────────────────
+
+  Future<File> _getSessionFile() async {
+    if (_currentWorkspacePath != null) {
+      return File(path.join(_currentWorkspacePath!, '.shadowtrim_session.json'));
+    }
+    final docDir = await getApplicationDocumentsDirectory();
+    return File(path.join(docDir.path, 'shadowtrim_global_session.json'));
+  }
+
+  Future<void> _saveSessionData() async {
+    try {
+      final file = await _getSessionFile();
+      final List<Map<String, dynamic>> clipData = _clips.map((c) => {
+        'filePath': c.filePath,
+        'fileName': c.fileName,
+        'originalFileName': c.originalFileName,
+        'isTrimmed': c.isTrimmed,
+        'trimmedOutputPath': c.trimmedOutputPath,
+        'startCutMs': c.startCut.inMilliseconds,
+        'endCutMs': c.endCut.inMilliseconds,
+        'durationMs': c.duration.inMilliseconds,
+      }).toList();
+      await file.writeAsString(jsonEncode({'clips': clipData}));
+    } catch (e) {
+      debugPrint('Failed to save session data: $e');
+    }
+  }
+
+  Future<void> _restoreSessionData() async {
+    try {
+      final file = await _getSessionFile();
+      if (!await file.exists()) return;
+      final content = await file.readAsString();
+      final Map<String, dynamic> json = jsonDecode(content);
+      final List<dynamic> savedClips = json['clips'] ?? [];
+      final Map<String, Map<String, dynamic>> byPath = {
+        for (final c in savedClips) (c['filePath'] as String): c as Map<String, dynamic>
+      };
+      setState(() {
+        for (final clip in _clips) {
+          final saved = byPath[clip.filePath];
+          if (saved != null) {
+            clip.fileName = saved['fileName'] as String? ?? clip.fileName;
+            clip.isTrimmed = saved['isTrimmed'] as bool? ?? false;
+            clip.trimmedOutputPath = saved['trimmedOutputPath'] as String?;
+            clip.startCut = Duration(milliseconds: (saved['startCutMs'] as int?) ?? 0);
+            clip.endCut = Duration(milliseconds: (saved['endCutMs'] as int?) ?? 0);
+            if (clip.isTrimmed) _blacklistedClipNames.add(clip.filePath);
+          }
+        }
+      });
+    } catch (e) {
+      debugPrint('Failed to restore session data: $e');
+    }
+  }
+
+  Future<void> _deleteSessionData() async {
+    try {
+      final file = await _getSessionFile();
+      if (await file.exists()) await file.delete();
+    } catch (e) {
+      debugPrint('Failed to delete session data: $e');
+    }
+  }
+
+  // ── End Session Dialog (from button in top bar) ───────────────────────────
+
+  Future<void> _showEndSessionDialog() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      barrierColor: Colors.black.withOpacity(0.8),
+      builder: (ctx) => Focus(
+        autofocus: true,
+        onKeyEvent: (node, event) {
+          if (event is KeyDownEvent) {
+            if (event.logicalKey == LogicalKeyboardKey.escape) {
+              Navigator.pop(ctx, false);
+              return KeyEventResult.handled;
+            }
+          }
+          return KeyEventResult.ignored;
+        },
+        child: Dialog(
+          backgroundColor: Colors.transparent,
+          child: Container(
+            width: 420,
+            decoration: BoxDecoration(
+              color: const Color(0xFF11111B),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.redAccent.withOpacity(0.35), width: 1),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Header
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                  decoration: const BoxDecoration(
+                    color: Color(0xFF1A0808),
+                    borderRadius: BorderRadius.only(topLeft: Radius.circular(9), topRight: Radius.circular(9)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 18),
+                      const SizedBox(width: 8),
+                      const Text('End This Session?', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 0.3)),
+                      const Spacer(),
+                      GestureDetector(
+                        onTap: () => Navigator.pop(ctx, false),
+                        child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                      ),
+                    ],
+                  ),
+                ),
+                // Content
+                const Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Are you sure you want to end this session?',
+                        style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
+                      ),
+                      SizedBox(height: 8),
+                      Text(
+                        'All clips flagged for deletion will be permanently moved to the Recycle Bin. '
+                        'This session\'s history will be cleared — trimmed clips will not be restored '
+                        'the next time you open this folder.',
+                        style: TextStyle(color: Colors.grey, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+                // Actions
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => Navigator.pop(ctx, false),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.white70,
+                            side: const BorderSide(color: Color(0xFF2E2E3E)),
+                            padding: const EdgeInsets.symmetric(vertical: 11),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                          ),
+                          child: const Text('Cancel', style: TextStyle(fontSize: 11)),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: () => Navigator.pop(ctx, true),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.red.shade900,
+                            foregroundColor: Colors.white,
+                            elevation: 0,
+                            padding: const EdgeInsets.symmetric(vertical: 11),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(6),
+                              side: BorderSide(color: Colors.redAccent.withOpacity(0.5)),
+                            ),
+                          ),
+                          child: const Text('End Session', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    if (confirmed == true) {
+      await _deleteQueuedOriginalFiles();
+      await _deleteSessionBlacklist();
+      await _deleteSessionData();
+      setState(() {
+        _clips.clear();
+        _selectedClipIndex = -1;
+        _blacklistedClipNames.clear();
+      });
+      _player.stop();
+    }
+  }
+
+  @override
+  Future<AppExitResponse> didRequestAppExit() async {
+    if (_clips.isNotEmpty || _blacklistedClipNames.isNotEmpty) {
+      final result = await _showSessionSavePrompt();
+      if (result == 'save') {
+        await _deleteQueuedOriginalFiles();
+        await _saveSessionData();
+        await _saveSessionBlacklist();
+        return AppExitResponse.exit;
+      } else if (result == 'delete') {
+        await _deleteQueuedOriginalFiles();
+        await _deleteSessionBlacklist();
+        await _deleteSessionData();
+        return AppExitResponse.exit;
+      } else {
+        return AppExitResponse.cancel;
+      }
+    }
+    return AppExitResponse.exit;
   }
 
   // Delete file with confirmation dialog
@@ -297,115 +797,130 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       barrierColor: Colors.black.withOpacity(0.8),
-      builder: (ctx) => Dialog(
-        backgroundColor: Colors.transparent,
-        child: Container(
-          width: 380,
-          decoration: BoxDecoration(
-            color: const Color(0xFF11111B),
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: Colors.redAccent.withOpacity(0.35), width: 1),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // Header
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                decoration: const BoxDecoration(
-                  color: Color(0xFF1A0A0A),
-                  borderRadius: BorderRadius.only(topLeft: Radius.circular(9), topRight: Radius.circular(9)),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(Icons.delete_forever_outlined, color: Colors.redAccent, size: 18),
-                    const SizedBox(width: 8),
-                    const Text('Delete Clip', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 0.3)),
-                    const Spacer(),
-                    GestureDetector(
-                      onTap: () => Navigator.pop(ctx, false),
-                      child: const Icon(Icons.close, size: 16, color: Colors.grey),
-                    ),
-                  ],
-                ),
-              ),
-              // Content
-              Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Permanently delete this clip from disk?',
-                      style: TextStyle(color: Colors.white70, fontSize: 12),
-                    ),
-                    const SizedBox(height: 10),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF0B0B0F),
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: const Color(0xFF2E2E3E)),
+      builder: (ctx) => Focus(
+        autofocus: true,
+        onKeyEvent: (node, event) {
+          if (event is KeyDownEvent) {
+            if (event.logicalKey == LogicalKeyboardKey.enter || event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+              Navigator.pop(ctx, true);
+              return KeyEventResult.handled;
+            } else if (event.logicalKey == LogicalKeyboardKey.escape) {
+              Navigator.pop(ctx, false);
+              return KeyEventResult.handled;
+            }
+          }
+          return KeyEventResult.ignored;
+        },
+        child: Dialog(
+          backgroundColor: Colors.transparent,
+          child: Container(
+            width: 380,
+            decoration: BoxDecoration(
+              color: const Color(0xFF11111B),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.redAccent.withOpacity(0.35), width: 1),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Header
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                  decoration: const BoxDecoration(
+                    color: Color(0xFF1A0A0A),
+                    borderRadius: BorderRadius.only(topLeft: Radius.circular(9), topRight: Radius.circular(9)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.delete_forever_outlined, color: Colors.redAccent, size: 18),
+                      const SizedBox(width: 8),
+                      const Text('Delete Clip', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 0.3)),
+                      const Spacer(),
+                      GestureDetector(
+                        onTap: () => Navigator.pop(ctx, false),
+                        child: const Icon(Icons.close, size: 16, color: Colors.grey),
                       ),
-                      child: Text(
-                        clip.fileName,
-                        style: const TextStyle(fontSize: 11, color: Colors.white60, fontFamily: 'monospace'),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    Row(
-                      children: [
-                        Icon(Icons.warning_amber_rounded, size: 13, color: Colors.orange.shade700),
-                        const SizedBox(width: 5),
-                        Text('This action cannot be undone.', style: TextStyle(color: Colors.orange.shade700, fontSize: 11)),
-                      ],
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-              // Actions
-              Container(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton(
-                        onPressed: () => Navigator.pop(ctx, false),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.white70,
-                          side: const BorderSide(color: Color(0xFF2E2E3E)),
-                          padding: const EdgeInsets.symmetric(vertical: 10),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                // Content
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Permanently delete this clip from disk?',
+                        style: TextStyle(color: Colors.white70, fontSize: 12),
+                      ),
+                      const SizedBox(height: 10),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF0B0B0F),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: const Color(0xFF2E2E3E)),
                         ),
-                        child: const Text('Cancel', style: TextStyle(fontSize: 12)),
+                        child: Text(
+                          clip.fileName,
+                          style: const TextStyle(fontSize: 11, color: Colors.white60, fontFamily: 'monospace'),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        onPressed: () => Navigator.pop(ctx, true),
-                        icon: const Icon(Icons.delete_forever_outlined, size: 14),
-                        label: const Text('Delete', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.red.shade900,
-                          foregroundColor: Colors.redAccent,
-                          padding: const EdgeInsets.symmetric(vertical: 10),
-                          elevation: 0,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(6),
-                            side: BorderSide(color: Colors.redAccent.withOpacity(0.5)),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Icon(Icons.warning_amber_rounded, size: 13, color: Colors.orange.shade700),
+                          const SizedBox(width: 5),
+                          Text('This action cannot be undone.', style: TextStyle(color: Colors.orange.shade700, fontSize: 11)),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                // Actions
+                Container(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => Navigator.pop(ctx, false),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.white70,
+                            side: const BorderSide(color: Color(0xFF2E2E3E)),
+                            padding: const EdgeInsets.symmetric(vertical: 10),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                          ),
+                          child: const Text('Cancel', style: TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: () => Navigator.pop(ctx, true),
+                          icon: const Icon(Icons.delete_forever_outlined, size: 14),
+                          label: const Text('Delete', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.red.shade900,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 10),
+                            elevation: 0,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(6),
+                              side: BorderSide(color: Colors.redAccent.withOpacity(0.5)),
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -413,10 +928,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     if (confirmed == true) {
       try {
-        final file = File(clip.filePath);
-        if (await file.exists()) {
-          await file.delete();
-        }
+        await _deleteToRecycleBin(clip.filePath);
         setState(() {
           _clips.remove(clip);
           // Reset selection if the deleted clip was selected
@@ -427,7 +939,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             _selectClip(_selectedClipIndex);
           }
         });
-        _showSnackBar('File deleted: ${clip.fileName}');
+        _showSnackBar('Clip deleted successfully: ${clip.fileName}', isDelete: true);
       } catch (e) {
         _showSnackBar('Failed to delete file: $e', isError: true);
       }
@@ -458,7 +970,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (cleanName.isEmpty) {
       cleanName = path.basenameWithoutExtension(clip.fileName) + '_trimmed';
     }
-    final customOutputPath = path.join(dir, '$cleanName$ext');
+    String customOutputPath = path.join(dir, '$cleanName$ext');
+    if (!clip.isTrimmed) {
+      int counter = 1;
+      while (File(customOutputPath).existsSync()) {
+        counter++;
+        customOutputPath = path.join(dir, '$cleanName ($counter)$ext');
+      }
+    }
 
     try {
       // Time parameters formatted as HH:MM:SS.xxx
@@ -491,7 +1010,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
         setState(() {
           clip.isTrimmed = true;
           clip.isAnimating = false;
+          clip.trimmedOutputPath = customOutputPath;
+          clip.fileName = path.basename(customOutputPath);
+          _blacklistedClipNames.add(clip.filePath); // Add to blacklist
         });
+
+        if (_deleteOriginalAfterTrim) {
+          setState(() {
+            _originalClipsToDelete.add(clip.filePath);
+          });
+        }
+
+        // Auto-Advance on Trim
+        if (_selectedClipIndex < _clips.length - 1) {
+          _selectClip(_selectedClipIndex + 1);
+        }
       }
 
       _showSnackBar('Export Success: $customOutputPath');
@@ -593,6 +1126,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ],
             ),
           ),
+          const Spacer(),
+          if (_clips.isNotEmpty)
+            TextButton.icon(
+              onPressed: _showEndSessionDialog,
+              icon: const Icon(Icons.stop_circle_outlined, size: 14, color: Colors.redAccent),
+              label: const Text('End Session', style: TextStyle(fontSize: 11, color: Colors.redAccent)),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              ),
+            ),
         ],
       ),
     );
@@ -682,20 +1225,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   color: const Color(0xFF1E1E2E),
                   itemBuilder: (context) => [
                     PopupMenuItem(
-                      value: 'name',
-                      child: Text('Name (A-Z)', style: TextStyle(fontSize: 11, color: _sortBy == 'name' ? const Color(0xFF76B900) : Colors.white)),
+                      value: 'created_desc',
+                      child: Text('Date Created (Newest)', style: TextStyle(fontSize: 11, color: _sortBy == 'created_desc' ? const Color(0xFF76B900) : Colors.white)),
                     ),
                     PopupMenuItem(
-                      value: 'size',
-                      child: Text('Size (Largest first)', style: TextStyle(fontSize: 11, color: _sortBy == 'size' ? const Color(0xFF76B900) : Colors.white)),
-                    ),
-                    PopupMenuItem(
-                      value: 'modified',
-                      child: Text('Date Modified', style: TextStyle(fontSize: 11, color: _sortBy == 'modified' ? const Color(0xFF76B900) : Colors.white)),
-                    ),
-                    PopupMenuItem(
-                      value: 'created',
-                      child: Text('Date Created', style: TextStyle(fontSize: 11, color: _sortBy == 'created' ? const Color(0xFF76B900) : Colors.white)),
+                      value: 'created_asc',
+                      child: Text('Date Created (Oldest)', style: TextStyle(fontSize: 11, color: _sortBy == 'created_asc' ? const Color(0xFF76B900) : Colors.white)),
                     ),
                   ],
                 ),
@@ -801,8 +1336,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final int idx = _clips.indexOf(clip);
     final isSelected = idx == _selectedClipIndex;
     
+    final tileKey = _clipKeys.putIfAbsent(clip, () => GlobalKey());
     return AnimatedSlide(
-      key: ValueKey(clip.filePath),
+      key: tileKey,
       offset: clip.isAnimating ? const Offset(0.0, -0.8) : Offset.zero,
       duration: const Duration(milliseconds: 350),
       curve: Curves.easeInOutCubic,
@@ -813,7 +1349,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 350),
           curve: Curves.easeInOut,
-          height: clip.isAnimating ? 0 : 54,
+          height: clip.isAnimating
+              ? 0
+              : (clip.isTrimmed && clip.fileName != clip.originalFileName ? 68 : 54),
           margin: clip.isAnimating ? EdgeInsets.zero : const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
           child: clip.isAnimating 
               ? const SizedBox.shrink() 
@@ -873,31 +1411,73 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                     : Colors.grey.shade300,
                               ),
                             ),
-                      subtitle: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Text(
-                            clip.fileSizeFormatted,
-                            style: TextStyle(fontSize: 10, color: Colors.grey.shade500),
-                          ),
-                          Text(
-                            clip.duration != Duration.zero 
-                                ? _formatDuration(clip.duration).split('.')[0]
-                                : 'Loading...',
-                            style: TextStyle(fontSize: 10, color: Colors.grey.shade500),
-                          ),
-                        ],
-                      ),
+                      subtitle: (clip.isTrimmed && clip.fileName != clip.originalFileName)
+                          ? Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  clip.originalFileName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(fontSize: 9, color: Colors.grey.shade500),
+                                ),
+                                const SizedBox(height: 2),
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                  children: [
+                                    Text(
+                                      clip.fileSizeFormatted,
+                                      style: TextStyle(fontSize: 9, color: Colors.grey.shade500),
+                                    ),
+                                    Text(
+                                      clip.duration != Duration.zero 
+                                          ? _formatDuration(clip.duration).split('.')[0]
+                                          : 'Loading...',
+                                      style: TextStyle(fontSize: 9, color: Colors.grey.shade500),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            )
+                          : Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text(
+                                  clip.fileSizeFormatted,
+                                  style: TextStyle(fontSize: 10, color: Colors.grey.shade500),
+                                ),
+                                Text(
+                                  clip.duration != Duration.zero 
+                                      ? _formatDuration(clip.duration).split('.')[0]
+                                      : 'Loading...',
+                                  style: TextStyle(fontSize: 10, color: Colors.grey.shade500),
+                                ),
+                              ],
+                            ),
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
+                          if (clip.isTrimmed && File(clip.filePath).existsSync()) ...[
+                            IconButton(
+                              icon: const Icon(Icons.edit, size: 14, color: Color(0xFF76B900)),
+                              tooltip: 'Edit / Revise',
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(),
+                              onPressed: () => _selectClip(idx, forceOriginal: true),
+                            ),
+                            const SizedBox(width: 8),
+                          ],
                           IconButton(
                             icon: const Icon(Icons.folder_open, size: 14, color: Colors.grey),
                             tooltip: 'Reveal in File Explorer',
                             padding: EdgeInsets.zero,
                             constraints: const BoxConstraints(),
                             onPressed: () {
-                              Process.run('explorer', ['/select,', clip.filePath]);
+                              final revealPath = (clip.isTrimmed && clip.trimmedOutputPath != null)
+                                  ? clip.trimmedOutputPath!
+                                  : clip.filePath;
+                              Process.run('explorer', ['/select,', revealPath]);
                             },
                           ),
                           const SizedBox(width: 8),
@@ -910,11 +1490,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                               setState(() {
                                 _clips.removeAt(idx);
                                 if (_selectedClipIndex == idx) {
-                                  _selectedClipIndex = -1;
-                                  _player.open(Media(''), play: false);
-                                  if (_clips.isNotEmpty) {
-                                    _selectClip(0);
-                                  }
+                                    _selectedClipIndex = -1;
+                                    _player.open(Media(''), play: false);
+                                    if (_clips.isNotEmpty) {
+                                      _selectClip(0);
+                                    }
                                 } else if (_selectedClipIndex > idx) {
                                   _selectedClipIndex--;
                                 }
@@ -923,7 +1503,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           ),
                         ],
                       ),
-                      onTap: () => _selectClip(idx),
+                      onTap: () {
+                        final fileToLoad = clip.isTrimmed ? (clip.trimmedOutputPath ?? clip.filePath) : clip.filePath;
+                        if (!File(fileToLoad).existsSync()) {
+                          _showSnackBar('Target file does not exist.', isError: true);
+                        } else {
+                          _selectClip(idx);
+                        }
+                      },
                     ),
                   ),
                 ),
@@ -953,7 +1540,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
       );
     }
 
-    final Duration duration = activeClip.duration;
+    final Duration duration = _viewingTrimmedMode
+        ? (activeClip.endCut - activeClip.startCut)
+        : activeClip.duration;
     final double maxMs = duration.inMilliseconds.toDouble();
 
     return Focus(
@@ -961,6 +1550,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       autofocus: true,
       onKeyEvent: (node, event) {
         if (event is KeyDownEvent) {
+          final isShiftPressed = HardwareKeyboard.instance.isShiftPressed;
           if (event.logicalKey == LogicalKeyboardKey.space || event.logicalKey == LogicalKeyboardKey.keyK) {
             if (_player.state.playing) {
               _player.pause();
@@ -977,46 +1567,110 @@ class _DashboardScreenState extends State<DashboardScreen> {
             _player.seek(newPos > duration ? duration : newPos);
             return KeyEventResult.handled;
           } else if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+            if (isShiftPressed) {
+              setState(() {
+                _volume = (_volume + 5.0).clamp(0.0, 100.0);
+              });
+              _player.setVolume(_volume);
+              return KeyEventResult.handled;
+            }
             _selectPreviousClip();
             return KeyEventResult.handled;
           } else if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+            if (isShiftPressed) {
+              setState(() {
+                _volume = (_volume - 5.0).clamp(0.0, 100.0);
+              });
+              _player.setVolume(_volume);
+              return KeyEventResult.handled;
+            }
             _selectNextClip();
             return KeyEventResult.handled;
           } else if (event.logicalKey == LogicalKeyboardKey.keyJ) {
-            final newPos = _currentPosition - const Duration(seconds: 5);
-            _player.seek(newPos < Duration.zero ? Duration.zero : newPos);
-            return KeyEventResult.handled;
+            if (isShiftPressed) {
+              if (activeClip != null) {
+                _player.seek(activeClip.startCut);
+              }
+              return KeyEventResult.handled;
+            } else {
+              final newPos = _currentPosition - const Duration(seconds: 5);
+              _player.seek(newPos < Duration.zero ? Duration.zero : newPos);
+              return KeyEventResult.handled;
+            }
           } else if (event.logicalKey == LogicalKeyboardKey.keyL) {
-            final newPos = _currentPosition + const Duration(seconds: 5);
-            _player.seek(newPos > duration ? duration : newPos);
-            return KeyEventResult.handled;
+            if (isShiftPressed) {
+              if (activeClip != null) {
+                _player.seek(activeClip.endCut);
+              }
+              return KeyEventResult.handled;
+            } else {
+              final newPos = _currentPosition + const Duration(seconds: 5);
+              _player.seek(newPos > duration ? duration : newPos);
+              return KeyEventResult.handled;
+            }
           } else if (event.logicalKey == LogicalKeyboardKey.bracketLeft) {
-            _setStartCut();
+            if (!_viewingTrimmedMode) {
+              _setStartCut();
+            }
             return KeyEventResult.handled;
           } else if (event.logicalKey == LogicalKeyboardKey.bracketRight) {
-            _setEndCut();
+            if (!_viewingTrimmedMode) {
+              _setEndCut();
+            }
             return KeyEventResult.handled;
           } else if (event.logicalKey == LogicalKeyboardKey.enter || event.logicalKey == LogicalKeyboardKey.numpadEnter) {
             if (!_isExporting && activeClip != null) {
               _exportActiveClip();
             }
             return KeyEventResult.handled;
-          } else if (event.logicalKey == LogicalKeyboardKey.digit1) {
-            // Seek to 25% of video
-            if (duration > Duration.zero) {
-              _player.seek(Duration(milliseconds: (duration.inMilliseconds * 0.25).toInt()));
+          } else if (event.logicalKey == LogicalKeyboardKey.keyI) {
+            if (isShiftPressed) {
+              _player.seek(Duration.zero);
+            } else {
+              if (duration > Duration.zero) {
+                _player.seek(Duration(milliseconds: (duration.inMilliseconds * 0.25).toInt()));
+              }
             }
             return KeyEventResult.handled;
-          } else if (event.logicalKey == LogicalKeyboardKey.digit2) {
-            // Seek to 50% of video
+          } else if (event.logicalKey == LogicalKeyboardKey.keyO) {
             if (duration > Duration.zero) {
               _player.seek(Duration(milliseconds: (duration.inMilliseconds * 0.50).toInt()));
             }
             return KeyEventResult.handled;
-          } else if (event.logicalKey == LogicalKeyboardKey.digit3) {
-            // Seek to 75% of video
-            if (duration > Duration.zero) {
-              _player.seek(Duration(milliseconds: (duration.inMilliseconds * 0.75).toInt()));
+          } else if (event.logicalKey == LogicalKeyboardKey.keyP) {
+            if (isShiftPressed) {
+              _player.seek(duration);
+            } else {
+              if (duration > Duration.zero) {
+                _player.seek(Duration(milliseconds: (duration.inMilliseconds * 0.75).toInt()));
+              }
+            }
+            return KeyEventResult.handled;
+          } else if (event.logicalKey == LogicalKeyboardKey.keyM) {
+            _toggleMute();
+            return KeyEventResult.handled;
+          } else if (event.logicalKey == LogicalKeyboardKey.comma) {
+            if (isShiftPressed) {
+              _changeSpeed(false);
+              return KeyEventResult.handled;
+            }
+          } else if (event.logicalKey == LogicalKeyboardKey.period) {
+            if (isShiftPressed) {
+              _changeSpeed(true);
+              return KeyEventResult.handled;
+            }
+          } else if (event.logicalKey == LogicalKeyboardKey.delete) {
+            if (activeClip != null && !_isExporting) {
+              _confirmDeleteFile(activeClip);
+            }
+            return KeyEventResult.handled;
+          } else if (event.logicalKey == LogicalKeyboardKey.f2) {
+            if (activeClip != null) {
+              _exportNameFocusNode.requestFocus();
+              _exportNameController.selection = TextSelection(
+                baseOffset: 0,
+                extentOffset: _exportNameController.text.length,
+              );
             }
             return KeyEventResult.handled;
           }
@@ -1124,9 +1778,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         SliderTheme(
                           data: SliderThemeData(
                             trackHeight: 6,
-                            activeTrackColor: const Color(0xFF76B900),
+                            activeTrackColor: _viewingTrimmedMode ? Colors.grey.shade700 : const Color(0xFF76B900),
                             inactiveTrackColor: Colors.grey.shade900,
-                            thumbColor: const Color(0xFF76B900),
+                            thumbColor: _viewingTrimmedMode ? Colors.grey.shade600 : const Color(0xFF76B900),
                             rangeThumbShape: const BracketRangeSliderThumbShape(),
                             overlayShape: SliderComponentShape.noOverlay,
                             rangeTrackShape: const AlignedRangeSliderTrackShape(),
@@ -1135,10 +1789,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             min: 0,
                             max: maxMs,
                             values: RangeValues(
-                              activeClip.startCut.inMilliseconds.toDouble().clamp(0.0, maxMs),
-                              activeClip.endCut.inMilliseconds.toDouble().clamp(0.0, maxMs),
+                              _viewingTrimmedMode ? 0.0 : activeClip.startCut.inMilliseconds.toDouble().clamp(0.0, maxMs),
+                              _viewingTrimmedMode ? maxMs : activeClip.endCut.inMilliseconds.toDouble().clamp(0.0, maxMs),
                             ),
-                            onChanged: (RangeValues vals) {
+                            onChanged: _viewingTrimmedMode ? null : (RangeValues vals) {
                               setState(() {
                                 activeClip.startCut = Duration(milliseconds: vals.start.toInt());
                                 activeClip.endCut = Duration(milliseconds: vals.end.toInt());
@@ -1161,37 +1815,37 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               OutlinedButton.icon(
-                                onPressed: _setStartCut,
-                                icon: const Text(
+                                onPressed: _viewingTrimmedMode ? null : _setStartCut,
+                                icon: Text(
                                   '[',
                                   style: TextStyle(
                                     fontSize: 14,
                                     fontWeight: FontWeight.bold,
-                                    color: Color(0xFF76B900),
+                                    color: _viewingTrimmedMode ? Colors.grey : const Color(0xFF76B900),
                                   ),
                                 ),
                                 label: const Text('Set Start', style: TextStyle(fontSize: 11)),
                                 style: OutlinedButton.styleFrom(
-                                  side: BorderSide(color: const Color(0xFF76B900).withOpacity(0.5)),
-                                  foregroundColor: Colors.white,
+                                  side: BorderSide(color: _viewingTrimmedMode ? Colors.grey.withOpacity(0.3) : const Color(0xFF76B900).withOpacity(0.5)),
+                                  foregroundColor: _viewingTrimmedMode ? Colors.grey : Colors.white,
                                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                                 ),
                               ),
                               const SizedBox(width: 8),
                               OutlinedButton.icon(
-                                onPressed: _setEndCut,
-                                icon: const Text(
+                                onPressed: _viewingTrimmedMode ? null : _setEndCut,
+                                icon: Text(
                                   ']',
                                   style: TextStyle(
                                     fontSize: 14,
                                     fontWeight: FontWeight.bold,
-                                    color: Colors.redAccent,
+                                    color: _viewingTrimmedMode ? Colors.grey : Colors.redAccent,
                                   ),
                                 ),
                                 label: const Text('Set End', style: TextStyle(fontSize: 11)),
                                 style: OutlinedButton.styleFrom(
-                                  side: BorderSide(color: Colors.redAccent.withOpacity(0.5)),
-                                  foregroundColor: Colors.white,
+                                  side: BorderSide(color: _viewingTrimmedMode ? Colors.grey.withOpacity(0.3) : Colors.redAccent.withOpacity(0.5)),
+                                  foregroundColor: _viewingTrimmedMode ? Colors.grey : Colors.white,
                                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                                 ),
                               ),
@@ -1207,6 +1861,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
+                              IconButton(
+                                icon: const Icon(Icons.first_page, color: Color(0xFF76B900)),
+                                tooltip: 'Jump to Start Cut (Shift+J)',
+                                onPressed: () {
+                                  if (activeClip != null) {
+                                    _player.seek(activeClip.startCut);
+                                  }
+                                },
+                              ),
+                              const SizedBox(width: 4),
                               IconButton(
                                 icon: const Icon(Icons.replay_5, color: Colors.grey),
                                 onPressed: () {
@@ -1245,30 +1909,57 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                   _player.seek(newPos > duration ? duration : newPos);
                                 },
                               ),
+                              const SizedBox(width: 4),
+                              IconButton(
+                                icon: const Icon(Icons.last_page, color: Colors.redAccent),
+                                tooltip: 'Jump to End Cut (Shift+L)',
+                                onPressed: () {
+                                  if (activeClip != null) {
+                                    _player.seek(activeClip.endCut);
+                                  }
+                                },
+                              ),
                             ],
                           ),
                         ),
                       ),
 
-                      // Volume Control (Right Aligned)
+                      // Volume & Speed Control (Right Aligned)
                       Expanded(
                         child: Align(
                           alignment: Alignment.centerRight,
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              GestureDetector(
-                                onTap: () {
+                              // Playback speed selector
+                              PopupMenuButton<double>(
+                                tooltip: 'Playback Speed (< or >)',
+                                offset: const Offset(0, -145),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                                  decoration: BoxDecoration(
+                                    border: Border.all(color: Colors.grey.shade800),
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: Text(
+                                    '${_playbackSpeed.toStringAsFixed(1).replaceAll('.0', '')}x',
+                                    style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.white70),
+                                  ),
+                                ),
+                                onSelected: (speed) {
                                   setState(() {
-                                    if (_volume > 0) {
-                                      _lastVolume = _volume;
-                                      _volume = 0;
-                                    } else {
-                                      _volume = _lastVolume > 0 ? _lastVolume : 100;
-                                    }
-                                    _player.setVolume(_volume);
+                                    _playbackSpeed = speed;
                                   });
+                                  _player.setRate(speed);
                                 },
+                                itemBuilder: (context) => [1.0, 1.5, 2.0, 3.0].map((speed) => PopupMenuItem<double>(
+                                  value: speed,
+                                  child: Text('${speed.toStringAsFixed(1).replaceAll('.0', '')}x', style: TextStyle(fontSize: 11, color: _playbackSpeed == speed ? const Color(0xFF76B900) : Colors.white)),
+                                )).toList(),
+                              ),
+                              const SizedBox(width: 10),
+                              GestureDetector(
+                                onTap: _toggleMute,
                                 child: Icon(
                                   _volume == 0 ? Icons.volume_off : (_volume < 50 ? Icons.volume_down : Icons.volume_up),
                                   size: 14,
@@ -1338,8 +2029,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
           const SizedBox(height: 6),
           TextField(
             controller: _exportNameController,
+            focusNode: _exportNameFocusNode,
             enabled: activeClip != null,
             style: const TextStyle(fontSize: 12),
+            onSubmitted: (_) {
+              _focusNode.requestFocus();
+            },
             decoration: InputDecoration(
               isDense: true,
               contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
@@ -1443,6 +2138,60 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ),
             ],
           ),
+          const SizedBox(height: 8),
+
+          // Delete original clip after trim checkbox
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              SizedBox(
+                height: 24,
+                width: 24,
+                child: Checkbox(
+                  value: _deleteOriginalAfterTrim,
+                  activeColor: Colors.redAccent,
+                  onChanged: (val) {
+                    setState(() {
+                      _deleteOriginalAfterTrim = val ?? false;
+                    });
+                  },
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'Delete original clip after trim',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: _deleteOriginalAfterTrim ? Colors.redAccent : Colors.white70,
+                        fontWeight: _deleteOriginalAfterTrim ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
+                    if (_deleteOriginalAfterTrim)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 3),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.warning_amber_rounded, size: 11, color: Colors.redAccent),
+                            const SizedBox(width: 4),
+                            const Flexible(
+                              child: Text(
+                                "You can't revise the clip after ending the session!",
+                                style: TextStyle(fontSize: 9, color: Colors.redAccent),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
           const SizedBox(height: 20),
 
           // Video Metadata Card
@@ -1469,6 +2218,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 const SizedBox(height: 10),
                 if (activeClip != null) ...[
                   _buildMetadataRow('File', activeClip.fileName),
+                  if (activeClip.fileName != activeClip.originalFileName)
+                    _buildMetadataRow('Original File', activeClip.originalFileName),
                   _buildMetadataRow('Format', path.extension(activeClip.filePath).toUpperCase().replaceAll('.', '')),
                   _buildMetadataRow('Size', activeClip.fileSizeFormatted),
                   _buildMetadataRow('Duration', _formatDuration(activeClip.duration).split('.')[0]),
@@ -1523,13 +2274,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ],
                 ),
                 SizedBox(height: 8),
-                _ShortcutRow(keys: 'K / Space / Click', desc: 'Play / Pause'),
+                _ShortcutRow(keys: 'K / Space', desc: 'Play / Pause'),
                 _ShortcutRow(keys: 'Arrow Left / Right', desc: 'Seek 1s'),
                 _ShortcutRow(keys: 'J / L', desc: 'Seek 5s'),
+                _ShortcutRow(keys: 'Shift + J', desc: 'Jump to Start Cut'),
+                _ShortcutRow(keys: 'Shift + L', desc: 'Jump to End Cut'),
                 _ShortcutRow(keys: '[ / ]', desc: 'Set Start / End Cut'),
                 _ShortcutRow(keys: 'Arrow Up / Down', desc: 'Prev / Next Video'),
+                _ShortcutRow(keys: 'Shift + Up / Down', desc: 'Volume Up / Down'),
+                _ShortcutRow(keys: 'M', desc: 'Mute / Unmute'),
+                _ShortcutRow(keys: 'i / o / p', desc: 'Jump to 25% / 50% / 75%'),
+                _ShortcutRow(keys: 'Shift + i / p', desc: 'Jump to Start / End'),
+                _ShortcutRow(keys: 'Shift + < / >', desc: 'Playback Rate Down / Up'),
                 _ShortcutRow(keys: 'Enter', desc: 'Execute Trim'),
-                _ShortcutRow(keys: '1 / 2 / 3', desc: 'Jump to 25% / 50% / 75%'),
+                _ShortcutRow(keys: 'F2', desc: 'Rename Export File'),
+                _ShortcutRow(keys: 'Del', desc: 'Delete Selected Clip'),
               ],
             ),
           ),
@@ -1771,8 +2530,12 @@ class BracketRangeSliderThumbShape extends RangeSliderThumbShape {
     bool isPressed = false,
   }) {
     final Canvas canvas = context.canvas;
+    final Color enabledColor = sliderTheme.thumbColor ?? const Color(0xFF76B900);
+    final Color disabledColor = Colors.grey.shade700;
+    final Color color = Color.lerp(disabledColor, enabledColor, enableAnimation.value)!;
+
     final Paint paint = Paint()
-      ..color = sliderTheme.thumbColor ?? const Color(0xFF76B900)
+      ..color = color
       ..style = PaintingStyle.stroke
       ..strokeWidth = 3
       ..strokeCap = StrokeCap.round;
@@ -1864,6 +2627,10 @@ class _VideoThumbnailWidgetState extends State<VideoThumbnailWidget> {
   }
 
   Future<void> _loadFrame() async {
+    final file = File(widget.filePath);
+    if (!await file.exists()) {
+      return;
+    }
     await _thumbPlayer.open(Media(widget.filePath), play: false);
     // Seek to 5% into the video for a more representative frame
     final duration = _thumbPlayer.state.duration;
