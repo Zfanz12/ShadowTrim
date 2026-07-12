@@ -9,6 +9,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
+import 'package:flutter_window_close/flutter_window_close.dart';
 import '../models/clip_model.dart';
 import '../services/video_service.dart';
 
@@ -26,6 +27,11 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   bool _viewingTrimmedMode = false;
   final Set<String> _blacklistedClipNames = {};
   final Set<String> _originalClipsToDelete = {};
+  List<VideoClip> _deletedClips = [];
+  bool _deletedExpanded = true;
+  String? _lastSessionWorkspacePath;
+  bool _isShowingExitDialog = false;
+  bool _isExiting = false;
 
   // State
   List<VideoClip> _clips = [];
@@ -89,13 +95,22 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     _player.stream.duration.listen((duration) {
       if (duration != null && duration > Duration.zero && _selectedClipIndex != -1) {
         final currentClip = _clips[_selectedClipIndex];
-        if (currentClip.duration == Duration.zero) {
+        if (!_viewingTrimmedMode && currentClip.duration == Duration.zero) {
           setState(() {
             currentClip.duration = duration;
             currentClip.endCut = duration;
           });
         }
       }
+    });
+
+    // Load last session pointer so we can show "Continue" button
+    _loadLastSessionPointer();
+
+    // Intercept native close window clicks on desktop
+    FlutterWindowClose.setWindowShouldCloseHandler(() async {
+      final response = await didRequestAppExit();
+      return response == AppExitResponse.exit;
     });
   }
 
@@ -165,15 +180,42 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     }
   }
 
+  List<VideoClip> _getVisibleSelectableClips() {
+    final List<VideoClip> list = [];
+    if (_trimmedExpanded) {
+      list.addAll(_getTrimmedClips());
+    }
+    if (_untrimmedExpanded) {
+      list.addAll(_getUntrimmedClips());
+    }
+    return list;
+  }
+
   void _selectPreviousClip() {
-    if (_selectedClipIndex > 0) {
-      _selectClip(_selectedClipIndex - 1);
+    if (_selectedClipIndex == -1) return;
+    final activeClip = _clips[_selectedClipIndex];
+    final visibleClips = _getVisibleSelectableClips();
+    final idx = visibleClips.indexOf(activeClip);
+    if (idx > 0) {
+      final prevClip = visibleClips[idx - 1];
+      final newIdx = _clips.indexOf(prevClip);
+      if (newIdx != -1) {
+        _selectClip(newIdx);
+      }
     }
   }
 
   void _selectNextClip() {
-    if (_selectedClipIndex >= 0 && _selectedClipIndex < _clips.length - 1) {
-      _selectClip(_selectedClipIndex + 1);
+    if (_selectedClipIndex == -1) return;
+    final activeClip = _clips[_selectedClipIndex];
+    final visibleClips = _getVisibleSelectableClips();
+    final idx = visibleClips.indexOf(activeClip);
+    if (idx != -1 && idx < visibleClips.length - 1) {
+      final nextClip = visibleClips[idx + 1];
+      final newIdx = _clips.indexOf(nextClip);
+      if (newIdx != -1) {
+        _selectClip(newIdx);
+      }
     }
   }
 
@@ -497,12 +539,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'You have active items in this session.',
+                        'You have active clips in this session.',
                         style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
                       ),
                       SizedBox(height: 8),
                       Text(
-                        'Do you want to save the session? Saving will remember previously trimmed clips so they do not reappear next time.',
+                        'Do you want to save the session? Saving will remember previously trimmed clips.',
                         style: TextStyle(color: Colors.grey, fontSize: 12),
                       ),
                     ],
@@ -556,7 +598,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                               side: BorderSide(color: const Color(0xFF76B900).withOpacity(0.5)),
                             ),
                           ),
-                          child: const Text('Save', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                          child: const Text('Save Session', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
                         ),
                       ),
                     ],
@@ -587,6 +629,39 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     return File(path.join(docDir.path, 'shadowtrim_global_session.json'));
   }
 
+  Future<File> _getLastSessionPointerFile() async {
+    final docDir = await getApplicationDocumentsDirectory();
+    return File(path.join(docDir.path, 'shadowtrim_last_session_ptr.json'));
+  }
+
+  Future<void> _saveLastSessionPointer() async {
+    try {
+      if (_currentWorkspacePath == null) return;
+      final file = await _getLastSessionPointerFile();
+      await file.writeAsString(jsonEncode({'workspacePath': _currentWorkspacePath}));
+    } catch (e) {
+      debugPrint('Failed to save last session pointer: $e');
+    }
+  }
+
+  Future<void> _loadLastSessionPointer() async {
+    try {
+      final file = await _getLastSessionPointerFile();
+      if (!await file.exists()) return;
+      final content = await file.readAsString();
+      final Map<String, dynamic> data = jsonDecode(content);
+      final String? wp = data['workspacePath'] as String?;
+      if (wp == null) return;
+      // Check if the session file actually exists there
+      final sessionFile = File(path.join(wp, '.shadowtrim_session.json'));
+      if (await sessionFile.exists()) {
+        if (mounted) setState(() => _lastSessionWorkspacePath = wp);
+      }
+    } catch (e) {
+      debugPrint('Failed to load last session pointer: $e');
+    }
+  }
+
   Future<void> _saveSessionData() async {
     try {
       final file = await _getSessionFile();
@@ -599,8 +674,19 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         'startCutMs': c.startCut.inMilliseconds,
         'endCutMs': c.endCut.inMilliseconds,
         'durationMs': c.duration.inMilliseconds,
+        'flaggedForDeletion': _originalClipsToDelete.contains(c.filePath),
       }).toList();
-      await file.writeAsString(jsonEncode({'clips': clipData}));
+      final List<Map<String, dynamic>> deletedData = _deletedClips.map((c) => {
+        'filePath': c.filePath,
+        'fileName': c.fileName,
+        'originalFileName': c.originalFileName,
+      }).toList();
+      await file.writeAsString(jsonEncode({
+        'clips': clipData,
+        'deletedClips': deletedData,
+        'originalClipsToDelete': _originalClipsToDelete.toList(),
+      }));
+      await _saveLastSessionPointer();
     } catch (e) {
       debugPrint('Failed to save session data: $e');
     }
@@ -613,9 +699,25 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       final content = await file.readAsString();
       final Map<String, dynamic> json = jsonDecode(content);
       final List<dynamic> savedClips = json['clips'] ?? [];
+      final List<dynamic> savedDeleted = json['deletedClips'] ?? [];
+      final List<dynamic> savedToDelete = json['originalClipsToDelete'] ?? [];
       final Map<String, Map<String, dynamic>> byPath = {
         for (final c in savedClips) (c['filePath'] as String): c as Map<String, dynamic>
       };
+      final List<VideoClip> restoredDeleted = [];
+      for (final d in savedDeleted) {
+        final fp = d['filePath'] as String;
+        if (File(fp).existsSync()) {
+          restoredDeleted.add(VideoClip(
+            filePath: fp,
+            fileName: d['fileName'] as String? ?? path.basename(fp),
+            originalFileName: d['originalFileName'] as String? ?? path.basename(fp),
+            fileSizeBytes: File(fp).lengthSync(),
+            dateModified: File(fp).lastModifiedSync(),
+            dateCreated: File(fp).lastModifiedSync(),
+          ));
+        }
+      }
       setState(() {
         for (final clip in _clips) {
           final saved = byPath[clip.filePath];
@@ -625,9 +727,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             clip.trimmedOutputPath = saved['trimmedOutputPath'] as String?;
             clip.startCut = Duration(milliseconds: (saved['startCutMs'] as int?) ?? 0);
             clip.endCut = Duration(milliseconds: (saved['endCutMs'] as int?) ?? 0);
+            clip.duration = Duration(milliseconds: (saved['durationMs'] as int?) ?? 0);
             if (clip.isTrimmed) _blacklistedClipNames.add(clip.filePath);
           }
         }
+        _deletedClips = restoredDeleted;
+        _originalClipsToDelete.addAll(savedToDelete.cast<String>());
       });
     } catch (e) {
       debugPrint('Failed to restore session data: $e');
@@ -638,9 +743,63 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     try {
       final file = await _getSessionFile();
       if (await file.exists()) await file.delete();
+      // Also remove the last session pointer
+      final ptr = await _getLastSessionPointerFile();
+      if (await ptr.exists()) await ptr.delete();
     } catch (e) {
       debugPrint('Failed to delete session data: $e');
     }
+  }
+
+  /// Restores a session from a given workspace path (for "Continue" button)
+  Future<void> _continueLastSession(String workspacePath) async {
+    _currentWorkspacePath = workspacePath;
+    await _loadSessionBlacklist();
+    final sessionFile = File(path.join(workspacePath, '.shadowtrim_session.json'));
+    if (!await sessionFile.exists()) return;
+    final content = await sessionFile.readAsString();
+    final Map<String, dynamic> json = jsonDecode(content);
+    final List<dynamic> savedClips = json['clips'] ?? [];
+    final List<dynamic> savedDeleted = json['deletedClips'] ?? [];
+    final List<dynamic> savedToDelete = json['originalClipsToDelete'] ?? [];
+
+    final List<VideoClip> restoredClips = [];
+    for (final c in savedClips) {
+      final fp = c['filePath'] as String;
+      if (File(fp).existsSync()) {
+        final clip = await VideoClip.fromPath(fp);
+        clip.fileName = c['fileName'] as String? ?? clip.fileName;
+        clip.isTrimmed = c['isTrimmed'] as bool? ?? false;
+        clip.trimmedOutputPath = c['trimmedOutputPath'] as String?;
+        clip.startCut = Duration(milliseconds: (c['startCutMs'] as int?) ?? 0);
+        clip.endCut = Duration(milliseconds: (c['endCutMs'] as int?) ?? 0);
+        clip.duration = Duration(milliseconds: (c['durationMs'] as int?) ?? 0);
+        if (clip.isTrimmed) _blacklistedClipNames.add(clip.filePath);
+        restoredClips.add(clip);
+      }
+    }
+    final List<VideoClip> restoredDeleted = [];
+    for (final d in savedDeleted) {
+      final fp = d['filePath'] as String;
+      if (File(fp).existsSync()) {
+        restoredDeleted.add(VideoClip(
+          filePath: fp,
+          fileName: d['fileName'] as String? ?? path.basename(fp),
+          originalFileName: d['originalFileName'] as String? ?? path.basename(fp),
+          fileSizeBytes: File(fp).lengthSync(),
+          dateModified: File(fp).lastModifiedSync(),
+          dateCreated: File(fp).lastModifiedSync(),
+        ));
+      }
+    }
+    setState(() {
+      _clips = restoredClips;
+      _deletedClips = restoredDeleted;
+      _originalClipsToDelete.addAll(savedToDelete.cast<String>());
+      _lastSessionWorkspacePath = null;
+      _sortClips();
+      if (_clips.isNotEmpty) _selectClip(0);
+    });
   }
 
   // ── End Session Dialog (from button in top bar) ───────────────────────────
@@ -759,13 +918,20 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
 
     if (confirmed == true) {
+      // Delete clips flagged via "Delete Clip" button
+      for (final clip in _deletedClips) {
+        await _deleteToRecycleBin(clip.filePath);
+      }
+      // Delete clips flagged via "Delete original clip after trim"
       await _deleteQueuedOriginalFiles();
       await _deleteSessionBlacklist();
       await _deleteSessionData();
       setState(() {
         _clips.clear();
+        _deletedClips.clear();
         _selectedClipIndex = -1;
         _blacklistedClipNames.clear();
+        _originalClipsToDelete.clear();
       });
       _player.stop();
     }
@@ -773,22 +939,44 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
   @override
   Future<AppExitResponse> didRequestAppExit() async {
-    if (_clips.isNotEmpty || _blacklistedClipNames.isNotEmpty) {
-      final result = await _showSessionSavePrompt();
-      if (result == 'save') {
-        await _deleteQueuedOriginalFiles();
-        await _saveSessionData();
-        await _saveSessionBlacklist();
+    if (!mounted) return AppExitResponse.exit;
+    if (_isExiting) return AppExitResponse.exit; // Already approved exit, let it close!
+    if (_isShowingExitDialog) return AppExitResponse.cancel;
+
+    if (_clips.isNotEmpty || _blacklistedClipNames.isNotEmpty || _deletedClips.isNotEmpty) {
+      try {
+        setState(() => _isShowingExitDialog = true);
+        final result = await _showSessionSavePrompt();
+        setState(() => _isShowingExitDialog = false);
+
+        if (result == 'save') {
+          setState(() => _isExiting = true);
+          // Save session WITHOUT executing deletions — they only run on End Session
+          await _saveSessionData();
+          await _saveSessionBlacklist();
+          return AppExitResponse.exit;
+        } else if (result == 'delete') {
+          setState(() => _isExiting = true);
+          // End This Session — execute all pending deletions
+          for (final clip in _deletedClips) {
+            await _deleteToRecycleBin(clip.filePath);
+          }
+          await _deleteQueuedOriginalFiles();
+          await _deleteSessionBlacklist();
+          await _deleteSessionData();
+          return AppExitResponse.exit;
+        } else {
+          return AppExitResponse.cancel;
+        }
+      } catch (e) {
+        setState(() => _isShowingExitDialog = false);
+        debugPrint('Error showing exit dialog: $e');
+        setState(() => _isExiting = true);
         return AppExitResponse.exit;
-      } else if (result == 'delete') {
-        await _deleteQueuedOriginalFiles();
-        await _deleteSessionBlacklist();
-        await _deleteSessionData();
-        return AppExitResponse.exit;
-      } else {
-        return AppExitResponse.cancel;
       }
     }
+    
+    setState(() => _isExiting = true);
     return AppExitResponse.exit;
   }
 
@@ -927,22 +1115,21 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
 
     if (confirmed == true) {
-      try {
-        await _deleteToRecycleBin(clip.filePath);
-        setState(() {
-          _clips.remove(clip);
-          // Reset selection if the deleted clip was selected
-          if (_selectedClipIndex >= _clips.length) {
-            _selectedClipIndex = _clips.isEmpty ? -1 : _clips.length - 1;
-          }
-          if (_selectedClipIndex >= 0) {
-            _selectClip(_selectedClipIndex);
-          }
-        });
-        _showSnackBar('Clip deleted successfully: ${clip.fileName}', isDelete: true);
-      } catch (e) {
-        _showSnackBar('Failed to delete file: $e', isError: true);
-      }
+      setState(() {
+        _clips.remove(clip);
+        _deletedClips.add(clip);
+        // Reset selection if the deleted clip was selected
+        if (_selectedClipIndex >= _clips.length) {
+          _selectedClipIndex = _clips.isEmpty ? -1 : _clips.length - 1;
+        }
+        if (_selectedClipIndex >= 0) {
+          _selectClip(_selectedClipIndex);
+        } else if (_clips.isEmpty) {
+          _player.stop();
+          _selectedClipIndex = -1;
+        }
+      });
+      _showSnackBar('Clip flagged for deletion. Will be removed on End Session.', isDelete: true);
     }
   }
 
@@ -971,13 +1158,15 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       cleanName = path.basenameWithoutExtension(clip.fileName) + '_trimmed';
     }
     String customOutputPath = path.join(dir, '$cleanName$ext');
-    if (!clip.isTrimmed) {
+    if (!clip.isTrimmed || customOutputPath != clip.trimmedOutputPath) {
       int counter = 1;
       while (File(customOutputPath).existsSync()) {
         counter++;
         customOutputPath = path.join(dir, '$cleanName ($counter)$ext');
       }
     }
+
+    final String? oldTrimmedPath = clip.isTrimmed ? clip.trimmedOutputPath : null;
 
     try {
       // Time parameters formatted as HH:MM:SS.xxx
@@ -1001,6 +1190,18 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       }
 
       if (result != null) {
+        // Delete old trimmed file if path changed to prevent duplication
+        if (oldTrimmedPath != null && oldTrimmedPath != customOutputPath) {
+          final oldFile = File(oldTrimmedPath);
+          if (oldFile.existsSync()) {
+            try {
+              oldFile.deleteSync();
+            } catch (e) {
+              debugPrint('Failed to delete old trimmed file: $e');
+            }
+          }
+        }
+
         setState(() {
           clip.isAnimating = true;
         });
@@ -1281,6 +1482,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                       }),
                       if (_untrimmedExpanded)
                         ..._getUntrimmedClips().map((clip) => _buildClipTile(clip)),
+                      if (_deletedClips.isNotEmpty) ...[
+                        const SizedBox(height: 12),
+                        _buildDeletedHeaderSection(),
+                        if (_deletedExpanded)
+                          ..._deletedClips.map((clip) => _buildDeletedClipTile(clip)),
+                      ],
                     ],
                   ),
           ),
@@ -1295,6 +1502,125 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
   List<VideoClip> _getTrimmedClips() {
     return _clips.where((c) => c.isTrimmed).toList();
+  }
+
+  Widget _buildDeletedHeaderSection() {
+    return InkWell(
+      onTap: () => setState(() => _deletedExpanded = !_deletedExpanded),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+        child: Row(
+          children: [
+            Icon(
+              _deletedExpanded ? Icons.keyboard_arrow_down : Icons.keyboard_arrow_right,
+              size: 14,
+              color: Colors.red.shade400,
+            ),
+            const SizedBox(width: 4),
+            const Icon(Icons.delete_sweep_outlined, size: 12, color: Colors.redAccent),
+            const SizedBox(width: 5),
+            Text(
+              'DELETED',
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.bold,
+                color: Colors.red.shade400,
+                letterSpacing: 1.2,
+              ),
+            ),
+            const SizedBox(width: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              decoration: BoxDecoration(
+                color: Colors.red.shade900.withOpacity(0.4),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(
+                '${_deletedClips.length}',
+                style: TextStyle(fontSize: 9, color: Colors.red.shade300, fontWeight: FontWeight.bold),
+              ),
+            ),
+            const Spacer(),
+            Text(
+              'on End Session',
+              style: TextStyle(fontSize: 9, color: Colors.red.shade700),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeletedClipTile(VideoClip clip) {
+    return Container(
+      height: 50,
+      margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+      decoration: BoxDecoration(
+        color: Colors.red.shade900.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.red.shade900.withOpacity(0.3), width: 1),
+      ),
+      child: ListTile(
+        dense: true,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        leading: SizedBox(
+          width: 48,
+          height: 36,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: ColorFiltered(
+                  colorFilter: const ColorFilter.matrix([
+                    0.2126, 0.7152, 0.0722, 0, 0,
+                    0.2126, 0.7152, 0.0722, 0, 0,
+                    0.2126, 0.7152, 0.0722, 0, 0,
+                    0,      0,      0,      1, 0,
+                  ]),
+                  child: VideoThumbnailWidget(filePath: clip.filePath),
+                ),
+              ),
+              Positioned(
+                right: 0,
+                bottom: 0,
+                child: Container(
+                  width: 14,
+                  height: 14,
+                  decoration: BoxDecoration(
+                    color: Colors.red.shade800,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.red.shade300, width: 0.5),
+                  ),
+                  child: const Icon(Icons.delete_outline, size: 9, color: Colors.white),
+                ),
+              ),
+            ],
+          ),
+        ),
+        title: Text(
+          clip.fileName,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(fontSize: 12, color: Colors.red.shade300, fontWeight: FontWeight.normal),
+        ),
+        subtitle: Text(
+          clip.fileSizeFormatted,
+          style: TextStyle(fontSize: 10, color: Colors.red.shade800),
+        ),
+        trailing: Tooltip(
+          message: 'Remove from deletion queue',
+          child: GestureDetector(
+            onTap: () {
+              setState(() {
+                _deletedClips.remove(clip);
+                _clips.add(clip);
+                _sortClips();
+              });
+            },
+            child: const Icon(Icons.undo_outlined, size: 15, color: Colors.grey),
+          ),
+        ),
+      ),
+    );
   }
 
   Widget _buildHeaderSection(String title, int count, bool isExpanded, VoidCallback onTap) {
@@ -1372,18 +1698,38 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                         width: 48,
                         height: 36,
                         child: Stack(
-                          alignment: Alignment.bottomRight,
                           children: [
-                            VideoThumbnailWidget(filePath: clip.filePath),
-                            if (clip.isTrimmed)
-                              Container(
-                                width: 14,
-                                height: 14,
-                                decoration: const BoxDecoration(
-                                  color: Color(0xFF76B900),
-                                  shape: BoxShape.circle,
+                            Positioned.fill(child: VideoThumbnailWidget(filePath: clip.filePath)),
+                            // Red trash icon (bottom-LEFT) if original is flagged for deletion
+                            if (_originalClipsToDelete.contains(clip.filePath))
+                              Positioned(
+                                left: 0,
+                                bottom: 0,
+                                child: Container(
+                                  width: 14,
+                                  height: 14,
+                                  decoration: BoxDecoration(
+                                    color: Colors.red.shade800,
+                                    shape: BoxShape.circle,
+                                    border: Border.all(color: Colors.red.shade300, width: 0.5),
+                                  ),
+                                  child: const Icon(Icons.delete_outline, size: 9, color: Colors.white),
                                 ),
-                                child: const Icon(Icons.check, size: 10, color: Colors.white),
+                              ),
+                            // Green check icon (bottom-RIGHT) if trimmed
+                            if (clip.isTrimmed)
+                              Positioned(
+                                right: 0,
+                                bottom: 0,
+                                child: Container(
+                                  width: 14,
+                                  height: 14,
+                                  decoration: const BoxDecoration(
+                                    color: Color(0xFF76B900),
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: const Icon(Icons.check, size: 10, color: Colors.white),
+                                ),
                               ),
                           ],
                         ),
@@ -1524,16 +1870,37 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     if (activeClip == null) {
       return Container(
         color: const Color(0xFF0F0F16),
-        child: const Center(
+        child: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(Icons.movie_outlined, size: 48, color: Colors.grey),
-              SizedBox(height: 12),
-              Text(
+              const Icon(Icons.movie_outlined, size: 48, color: Colors.grey),
+              const SizedBox(height: 12),
+              const Text(
                 'Import and select a video to start trimming.',
                 style: TextStyle(color: Colors.grey),
               ),
+              if (_lastSessionWorkspacePath != null) ...[
+                const SizedBox(height: 24),
+                ElevatedButton.icon(
+                  onPressed: () => _continueLastSession(_lastSessionWorkspacePath!),
+                  icon: const Icon(Icons.restore_outlined, size: 16),
+                  label: Text(
+                    'Continue last session  (${path.basename(_lastSessionWorkspacePath!)})',
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1E1E2E),
+                    foregroundColor: const Color(0xFF76B900),
+                    elevation: 0,
+                    padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      side: BorderSide(color: const Color(0xFF76B900).withOpacity(0.5)),
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
         ),
@@ -1708,14 +2075,18 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               child: Column(
                 children: [
                   // Cut Duration Details Row
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  Stack(
+                    alignment: Alignment.center,
                     children: [
-                      Text(
-                        _formatDuration(_currentPosition),
-                        style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Colors.white70),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          _formatDuration(_currentPosition),
+                          style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Colors.white70),
+                        ),
                       ),
                       Row(
+                        mainAxisSize: MainAxisSize.min,
                         children: [
                           Text(
                             'START: ${_formatDuration(activeClip.startCut)}',
@@ -1728,9 +2099,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                           ),
                         ],
                       ),
-                      Text(
-                        'DURATION AFTER CUT: ${_formatDuration(activeClip.endCut - activeClip.startCut)}',
-                        style: const TextStyle(fontSize: 11, fontFamily: 'monospace', fontWeight: FontWeight.bold, color: Colors.white),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: Text(
+                          'DURATION AFTER CUT: ${_formatDuration(activeClip.endCut - activeClip.startCut)}',
+                          style: const TextStyle(fontSize: 11, fontFamily: 'monospace', fontWeight: FontWeight.bold, color: Colors.white),
+                        ),
                       ),
                     ],
                   ),
@@ -2530,7 +2904,9 @@ class BracketRangeSliderThumbShape extends RangeSliderThumbShape {
     bool isPressed = false,
   }) {
     final Canvas canvas = context.canvas;
-    final Color enabledColor = sliderTheme.thumbColor ?? const Color(0xFF76B900);
+    final Color enabledColor = thumb == Thumb.start
+        ? (sliderTheme.thumbColor ?? const Color(0xFF76B900))
+        : Colors.redAccent;
     final Color disabledColor = Colors.grey.shade700;
     final Color color = Color.lerp(disabledColor, enabledColor, enableAnimation.value)!;
 
