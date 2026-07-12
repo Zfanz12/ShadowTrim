@@ -47,6 +47,8 @@ Before running this app, make sure you have:
 
 ## Installation
 
+Download from the latest version on Releases 
+OR
 1. **Clone the repository**
    ```bash
    git clone https://github.com/username/shadowtrim.git
