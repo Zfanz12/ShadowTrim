@@ -28,8 +28,20 @@ class VideoTrimmer {
         await outputFile.delete();
       }
 
+      // Use local ffmpeg.exe if present in the same directory as the app executable, otherwise fallback to system path
+      String ffmpegCmd = 'ffmpeg';
+      try {
+        final appDir = path.dirname(Platform.resolvedExecutable);
+        final localFFmpeg = File(path.join(appDir, Platform.isWindows ? 'ffmpeg.exe' : 'ffmpeg'));
+        if (localFFmpeg.existsSync()) {
+          ffmpegCmd = localFFmpeg.path;
+        }
+      } catch (e) {
+        // Fallback to system ffmpeg if Platform.resolvedExecutable fails (e.g. in test env)
+      }
+
       // FFmpeg command: ffmpeg -i input.mp4 -ss start -to end -c copy output.mp4
-      final result = await Process.run('ffmpeg', [
+      final result = await Process.run(ffmpegCmd, [
         '-i', inputPath,
         '-ss', startTime,
         '-to', endTime,

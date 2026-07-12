@@ -612,6 +612,130 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
   }
 
+  Future<void> _showAboutDialog() async {
+    await showDialog<void>(
+      context: context,
+      barrierColor: Colors.black.withOpacity(0.8),
+      builder: (ctx) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          width: 380,
+          decoration: BoxDecoration(
+            color: const Color(0xFF11111B),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: const Color(0xFF76B900).withOpacity(0.35), width: 1),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Header
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                decoration: const BoxDecoration(
+                  color: Color(0xFF0F1E15),
+                  borderRadius: BorderRadius.only(topLeft: Radius.circular(9), topRight: Radius.circular(9)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.info_outline, color: Color(0xFF76B900), size: 18),
+                    const SizedBox(width: 8),
+                    const Text('About ShadowTrim', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 0.3)),
+                    const Spacer(),
+                    GestureDetector(
+                      onTap: () => Navigator.pop(ctx),
+                      child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                    ),
+                  ],
+                ),
+              ),
+              // Content
+              Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Image.asset('assets/app_icon.png', width: 64, height: 64),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Hi, this is just a small project I made for fun',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Version : v2.0.0',
+                      style: TextStyle(color: Colors.grey, fontSize: 12, fontWeight: FontWeight.w500),
+                    ),
+                    const SizedBox(height: 24),
+                    // Social / Support Buttons
+                    _buildAboutLinkButton(
+                      icon: Icons.code,
+                      label: 'GitHub',
+                      color: const Color(0xFF24292F),
+                      url: 'https://github.com/Zfanz12',
+                    ),
+                    const SizedBox(height: 8),
+                    _buildAboutLinkButton(
+                      icon: Icons.camera_alt_outlined,
+                      label: 'Instagram',
+                      color: const Color(0xFFE1306C),
+                      url: 'https://www.instagram.com/zulfanfalah_12/',
+                    ),
+                    const SizedBox(height: 8),
+                    _buildAboutLinkButton(
+                      icon: Icons.coffee,
+                      label: 'Buy me a Roti-O',
+                      color: const Color(0xFFFF5E5B),
+                      url: 'https://ko-fi.com/S4Y52325J2',
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAboutLinkButton({
+    required IconData icon,
+    required String label,
+    required Color color,
+    required String url,
+  }) {
+    return SizedBox(
+      width: double.infinity,
+      child: ElevatedButton.icon(
+        onPressed: () => _launchUrl(url),
+        icon: Icon(icon, size: 16, color: Colors.white),
+        label: Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: color,
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(6),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _launchUrl(String url) async {
+    try {
+      if (Platform.isWindows) {
+        await Process.run('cmd', ['/c', 'start', url.replaceAll('&', '^&')]);
+      } else if (Platform.isMacOS) {
+        await Process.run('open', [url]);
+      } else if (Platform.isLinux) {
+        await Process.run('xdg-open', [url]);
+      }
+    } catch (e) {
+      debugPrint('Failed to launch URL: $e');
+    }
+  }
+
   Future<void> _deleteQueuedOriginalFiles() async {
     for (final filePath in _originalClipsToDelete) {
       await _deleteToRecycleBin(filePath);
@@ -1316,15 +1440,25 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       color: const Color(0xFF161622),
       child: Row(
         children: [
-          Image.asset('assets/app_icon.png', width: 28, height: 28),
-          const SizedBox(width: 8),
-          RichText(
-            text: const TextSpan(
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, letterSpacing: 0.5),
-              children: [
-                TextSpan(text: 'Shadow', style: TextStyle(color: Color(0xFF76B900))),
-                TextSpan(text: 'Trim', style: TextStyle(color: Colors.white)),
-              ],
+          GestureDetector(
+            onTap: _showAboutDialog,
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: Row(
+                children: [
+                  Image.asset('assets/app_icon.png', width: 28, height: 28),
+                  const SizedBox(width: 8),
+                  RichText(
+                    text: const TextSpan(
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, letterSpacing: 0.5),
+                      children: [
+                        TextSpan(text: 'Shadow', style: TextStyle(color: Color(0xFF76B900))),
+                        TextSpan(text: 'Trim', style: TextStyle(color: Colors.white)),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
           const Spacer(),
@@ -2705,6 +2839,24 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                 side: BorderSide(color: Colors.redAccent.withOpacity(0.5)),
               ),
               disabledBackgroundColor: Colors.grey.shade900,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Center(
+            child: InkWell(
+              onTap: _showAboutDialog,
+              borderRadius: BorderRadius.circular(4),
+              child: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                child: Text(
+                  'Created by ZFanz',
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: Colors.grey,
+                    decoration: TextDecoration.underline,
+                  ),
+                ),
+              ),
             ),
           ),
         ],
