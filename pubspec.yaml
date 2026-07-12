@@ -36,6 +36,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   file_picker: 8.0.0
   path_provider: ^2.1.6
+  flutter_window_close: ^1.0.0
   desktop_drop: ^0.7.1
   intl: ^0.20.3
   media_kit: ^1.2.6
