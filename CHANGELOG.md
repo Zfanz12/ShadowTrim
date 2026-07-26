@@ -7,6 +7,21 @@ _No items currently planned — all previously listed items have shipped in [2.0
 
 # Releases
 
+## [2.1.0] - 2026-07-27
+
+### Session Management System
+
+**Minor :**
+- **End Session Loading Animation** — Added a visual loading animation when clicking "End This Session" to clearly indicate that the background deletion process is running and to ensure the app does not appear frozen to the user.
+
+### Quality of Life (QoL) & UI/UX Improvements
+
+**Minor :**
+- **Expanded Playback Speed Control** — Added a new `0.5x` playback speed option to the speed selector, allowing for slower and more precise video review.
+- **Sort by File Size** — Added a new sorting feature allowing users to arrange their video list by file size ("Biggest" and "Smallest").
+- **Quick Folder Access** — Added an "Open Folder" icon directly in the header/file path area for quick and easy access to the clip's directory in the system file explorer.
+- **Global Cursor Pointer** — Updated the CSS/UX globally so the cursor now consistently changes to a pointer (hand icon) when hovering over any clickable button across the entire application.
+
 ## [2.0.0] - 2026-07-12
 
 ### Bug Fixes & Performance Enhancements
