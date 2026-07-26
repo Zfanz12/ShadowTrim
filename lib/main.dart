@@ -33,10 +33,29 @@ class ShadowClipApp extends StatelessWidget {
           style: ElevatedButton.styleFrom(
             backgroundColor: const Color(0xFF76B900),
             foregroundColor: Colors.white,
+            enabledMouseCursor: SystemMouseCursors.click,
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(8),
             ),
           ),
+        ),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(
+            enabledMouseCursor: SystemMouseCursors.click,
+          ),
+        ),
+        textButtonTheme: TextButtonThemeData(
+          style: TextButton.styleFrom(
+            enabledMouseCursor: SystemMouseCursors.click,
+          ),
+        ),
+        iconButtonTheme: IconButtonThemeData(
+          style: IconButton.styleFrom(
+            enabledMouseCursor: SystemMouseCursors.click,
+          ),
+        ),
+        popupMenuTheme: PopupMenuThemeData(
+          mouseCursor: WidgetStateProperty.all(SystemMouseCursors.click),
         ),
       ),
       home: const DashboardScreen(),

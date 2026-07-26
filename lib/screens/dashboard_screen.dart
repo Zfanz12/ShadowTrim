@@ -32,6 +32,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   String? _lastSessionWorkspacePath;
   bool _isShowingExitDialog = false;
   bool _isExiting = false;
+  bool _isEndingSession = false;
+  String _endingSessionStatus = '';
 
   // State
   List<VideoClip> _clips = [];
@@ -172,6 +174,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         break;
       case 'created_asc':
         _clips.sort((a, b) => a.dateCreated.compareTo(b.dateCreated));
+        break;
+      case 'size_desc':
+        _clips.sort((a, b) => b.fileSizeBytes.compareTo(a.fileSizeBytes));
+        break;
+      case 'size_asc':
+        _clips.sort((a, b) => a.fileSizeBytes.compareTo(b.fileSizeBytes));
         break;
     }
 
@@ -396,9 +404,9 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   }
 
   void _changeSpeed(bool increase) {
-    final List<double> speeds = [1.0, 1.5, 2.0, 3.0];
+    final List<double> speeds = [0.5, 1.0, 1.5, 2.0, 3.0];
     int index = speeds.indexOf(_playbackSpeed);
-    if (index == -1) index = 0;
+    if (index == -1) index = 1;
 
     if (increase) {
       if (index < speeds.length - 1) {
@@ -926,7 +934,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     });
   }
 
-  // ── End Session Dialog (from button in top bar) ───────────────────────────
+  // ── End Session Dialog & Cleanup Loading Indicator ────────────────────────
 
   Future<void> _showEndSessionDialog() async {
     final confirmed = await showDialog<bool>(
@@ -1042,22 +1050,60 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
 
     if (confirmed == true) {
-      // Delete clips flagged via "Delete Clip" button
-      for (final clip in _deletedClips) {
-        await _deleteToRecycleBin(clip.filePath);
-      }
-      // Delete clips flagged via "Delete original clip after trim"
-      await _deleteQueuedOriginalFiles();
-      await _deleteSessionBlacklist();
-      await _deleteSessionData();
       setState(() {
-        _clips.clear();
-        _deletedClips.clear();
-        _selectedClipIndex = -1;
-        _blacklistedClipNames.clear();
-        _originalClipsToDelete.clear();
+        _isEndingSession = true;
+        _endingSessionStatus = 'Deleting session files & moving to Recycle Bin... Please do not close the program.';
       });
-      _player.stop();
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Row(
+            children: [
+              SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+              ),
+              SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'Deleting session files... Please do not close the program!',
+                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
+                ),
+              ),
+            ],
+          ),
+          backgroundColor: Colors.red.shade900,
+          duration: const Duration(seconds: 8),
+        ),
+      );
+
+      try {
+        // Delete clips flagged via "Delete Clip" button
+        for (final clip in _deletedClips) {
+          await _deleteToRecycleBin(clip.filePath);
+        }
+        // Delete clips flagged via "Delete original clip after trim"
+        await _deleteQueuedOriginalFiles();
+        await _deleteSessionBlacklist();
+        await _deleteSessionData();
+        // Give progress bar visual time to animate
+        await Future.delayed(const Duration(milliseconds: 2000));
+      } finally {
+        if (mounted) {
+          setState(() {
+            _clips.clear();
+            _deletedClips.clear();
+            _selectedClipIndex = -1;
+            _blacklistedClipNames.clear();
+            _originalClipsToDelete.clear();
+            _isEndingSession = false;
+          });
+          _player.stop();
+          ScaffoldMessenger.of(context).hideCurrentSnackBar();
+          _showSnackBar('Session ended cleanly.');
+        }
+      }
     }
   }
 
@@ -1080,7 +1126,21 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           await _saveSessionBlacklist();
           return AppExitResponse.exit;
         } else if (result == 'delete') {
-          setState(() => _isExiting = true);
+          setState(() {
+            _isExiting = true;
+            _isEndingSession = true;
+            _endingSessionStatus = 'Deleting session files... Please do not close the program!';
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text(
+                'Deleting session files... Please do not close the program!',
+                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
+              ),
+              backgroundColor: Colors.red.shade900,
+              duration: const Duration(seconds: 8),
+            ),
+          );
           // End This Session — execute all pending deletions
           for (final clip in _deletedClips) {
             await _deleteToRecycleBin(clip.filePath);
@@ -1403,6 +1463,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           children: [
             // Top Bar
             _buildTopBar(),
+            if (_isEndingSession)
+              const LinearProgressIndicator(
+                minHeight: 3,
+                color: Colors.white,
+                backgroundColor: Color(0xFF1E1E2E),
+              ),
             const Divider(height: 1, color: Color(0xFF1E1E2E)),
             
             // Main Content Area
@@ -1426,6 +1492,45 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                 ],
               ),
             ),
+
+            // Bottom Deletion Progress Bar
+            if (_isEndingSession)
+              Container(
+                color: const Color(0xFF161622),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const LinearProgressIndicator(
+                      minHeight: 4,
+                      color: Colors.white,
+                      backgroundColor: Color(0xFF1E1E2E),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                      color: const Color(0xFF1F0C0C),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.delete_sweep_outlined, size: 16, color: Colors.white),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              _endingSessionStatus.isNotEmpty
+                                  ? _endingSessionStatus
+                                  : 'Deleting session files... Please do not close the program!',
+                              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white),
+                            ),
+                          ),
+                          const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
           ],
         ),
       ),
@@ -1529,7 +1634,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           ),
           const SizedBox(height: 4),
           
-          // Header list label & Sort Menu
+          // Header list label & Sort Menu & Open Folder
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 0),
             child: Row(
@@ -1546,26 +1651,53 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     ),
                   ),
                 ),
-                PopupMenuButton<String>(
-                  icon: const Icon(Icons.sort, size: 14, color: Colors.grey),
-                  tooltip: 'Sort list by...',
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
-                  onSelected: (val) {
-                    setState(() {
-                      _sortBy = val;
-                      _sortClips();
-                    });
-                  },
-                  color: const Color(0xFF1E1E2E),
-                  itemBuilder: (context) => [
-                    PopupMenuItem(
-                      value: 'created_desc',
-                      child: Text('Date Created (Newest)', style: TextStyle(fontSize: 11, color: _sortBy == 'created_desc' ? const Color(0xFF76B900) : Colors.white)),
-                    ),
-                    PopupMenuItem(
-                      value: 'created_asc',
-                      child: Text('Date Created (Oldest)', style: TextStyle(fontSize: 11, color: _sortBy == 'created_asc' ? const Color(0xFF76B900) : Colors.white)),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (_currentWorkspacePath != null) ...[
+                      IconButton(
+                        icon: const Icon(Icons.folder_open, size: 14, color: Colors.grey),
+                        tooltip: 'Open Workspace Folder in File Explorer',
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                        onPressed: () {
+                          if (_currentWorkspacePath != null) {
+                            Process.run('explorer', [_currentWorkspacePath!]);
+                          }
+                        },
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+                    PopupMenuButton<String>(
+                      icon: const Icon(Icons.sort, size: 14, color: Colors.grey),
+                      tooltip: 'Sort list by...',
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      onSelected: (val) {
+                        setState(() {
+                          _sortBy = val;
+                          _sortClips();
+                        });
+                      },
+                      color: const Color(0xFF1E1E2E),
+                      itemBuilder: (context) => [
+                        PopupMenuItem(
+                          value: 'created_desc',
+                          child: Text('Date Created (Newest)', style: TextStyle(fontSize: 11, color: _sortBy == 'created_desc' ? const Color(0xFF76B900) : Colors.white)),
+                        ),
+                        PopupMenuItem(
+                          value: 'created_asc',
+                          child: Text('Date Created (Oldest)', style: TextStyle(fontSize: 11, color: _sortBy == 'created_asc' ? const Color(0xFF76B900) : Colors.white)),
+                        ),
+                        PopupMenuItem(
+                          value: 'size_desc',
+                          child: Text('File Size (Biggest)', style: TextStyle(fontSize: 11, color: _sortBy == 'size_desc' ? const Color(0xFF76B900) : Colors.white)),
+                        ),
+                        PopupMenuItem(
+                          value: 'size_asc',
+                          child: Text('File Size (Smallest)', style: TextStyle(fontSize: 11, color: _sortBy == 'size_asc' ? const Color(0xFF76B900) : Colors.white)),
+                        ),
+                      ],
                     ),
                   ],
                 ),
@@ -2442,7 +2574,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                               // Playback speed selector
                               PopupMenuButton<double>(
                                 tooltip: 'Playback Speed (< or >)',
-                                offset: const Offset(0, -145),
+                                offset: const Offset(0, -175),
                                 child: Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
                                   decoration: BoxDecoration(
@@ -2450,7 +2582,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                                     borderRadius: BorderRadius.circular(4),
                                   ),
                                   child: Text(
-                                    '${_playbackSpeed.toStringAsFixed(1).replaceAll('.0', '')}x',
+                                    '${_playbackSpeed.toStringAsFixed(_playbackSpeed % 1 == 0 ? 0 : 1)}x',
                                     style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.white70),
                                   ),
                                 ),
@@ -2460,18 +2592,21 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                                   });
                                   _player.setRate(speed);
                                 },
-                                itemBuilder: (context) => [1.0, 1.5, 2.0, 3.0].map((speed) => PopupMenuItem<double>(
+                                itemBuilder: (context) => [0.5, 1.0, 1.5, 2.0, 3.0].map((speed) => PopupMenuItem<double>(
                                   value: speed,
-                                  child: Text('${speed.toStringAsFixed(1).replaceAll('.0', '')}x', style: TextStyle(fontSize: 11, color: _playbackSpeed == speed ? const Color(0xFF76B900) : Colors.white)),
+                                  child: Text('${speed.toStringAsFixed(speed % 1 == 0 ? 0 : 1)}x', style: TextStyle(fontSize: 11, color: _playbackSpeed == speed ? const Color(0xFF76B900) : Colors.white)),
                                 )).toList(),
                               ),
                               const SizedBox(width: 10),
-                              GestureDetector(
-                                onTap: _toggleMute,
-                                child: Icon(
-                                  _volume == 0 ? Icons.volume_off : (_volume < 50 ? Icons.volume_down : Icons.volume_up),
-                                  size: 14,
-                                  color: _volume == 0 ? Colors.redAccent : Colors.grey.shade500,
+                              MouseRegion(
+                                cursor: SystemMouseCursors.click,
+                                child: GestureDetector(
+                                  onTap: _toggleMute,
+                                  child: Icon(
+                                    _volume == 0 ? Icons.volume_off : (_volume < 50 ? Icons.volume_down : Icons.volume_up),
+                                    size: 14,
+                                    color: _volume == 0 ? Colors.redAccent : Colors.grey.shade500,
+                                  ),
                                 ),
                               ),
                               const SizedBox(width: 4),
@@ -2567,6 +2702,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           const SizedBox(height: 6),
           InkWell(
             onTap: _changeExportDirectory,
+            mouseCursor: SystemMouseCursors.click,
             borderRadius: BorderRadius.circular(6),
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -2611,6 +2747,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               alignment: Alignment.centerRight,
               child: InkWell(
                 onTap: () => setState(() => _customExportDir = null),
+                mouseCursor: SystemMouseCursors.click,
                 child: const Text(
                   'Reset to source folder',
                   style: TextStyle(fontSize: 10, color: Colors.grey, decoration: TextDecoration.underline),
@@ -2621,84 +2758,106 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           const SizedBox(height: 12),
 
           // Automatically add Trimmed folder checkbox
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              SizedBox(
-                height: 24,
-                width: 24,
-                child: Checkbox(
-                  value: _autoCreateTrimmedFolder,
-                  activeColor: const Color(0xFF76B900),
-                  onChanged: (val) {
-                    setState(() {
-                      _autoCreateTrimmedFolder = val ?? false;
-                    });
-                  },
-                ),
+          MouseRegion(
+            cursor: SystemMouseCursors.click,
+            child: GestureDetector(
+              onTap: () {
+                setState(() {
+                  _autoCreateTrimmedFolder = !_autoCreateTrimmedFolder;
+                });
+              },
+              behavior: HitTestBehavior.opaque,
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  SizedBox(
+                    height: 24,
+                    width: 24,
+                    child: Checkbox(
+                      value: _autoCreateTrimmedFolder,
+                      activeColor: const Color(0xFF76B900),
+                      onChanged: (val) {
+                        setState(() {
+                          _autoCreateTrimmedFolder = val ?? false;
+                        });
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      'Automatically add "Trimmed" folder',
+                      style: TextStyle(fontSize: 11, color: Colors.white70),
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(width: 8),
-              const Expanded(
-                child: Text(
-                  'Automatically add "Trimmed" folder',
-                  style: TextStyle(fontSize: 11, color: Colors.white70),
-                ),
-              ),
-            ],
+            ),
           ),
           const SizedBox(height: 8),
 
           // Delete original clip after trim checkbox
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              SizedBox(
-                height: 24,
-                width: 24,
-                child: Checkbox(
-                  value: _deleteOriginalAfterTrim,
-                  activeColor: Colors.redAccent,
-                  onChanged: (val) {
-                    setState(() {
-                      _deleteOriginalAfterTrim = val ?? false;
-                    });
-                  },
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      'Delete original clip after trim',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: _deleteOriginalAfterTrim ? Colors.redAccent : Colors.white70,
-                        fontWeight: _deleteOriginalAfterTrim ? FontWeight.bold : FontWeight.normal,
-                      ),
+          MouseRegion(
+            cursor: SystemMouseCursors.click,
+            child: GestureDetector(
+              onTap: () {
+                setState(() {
+                  _deleteOriginalAfterTrim = !_deleteOriginalAfterTrim;
+                });
+              },
+              behavior: HitTestBehavior.opaque,
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  SizedBox(
+                    height: 24,
+                    width: 24,
+                    child: Checkbox(
+                      value: _deleteOriginalAfterTrim,
+                      activeColor: Colors.redAccent,
+                      onChanged: (val) {
+                        setState(() {
+                          _deleteOriginalAfterTrim = val ?? false;
+                        });
+                      },
                     ),
-                    if (_deleteOriginalAfterTrim)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 3),
-                        child: Row(
-                          children: [
-                            const Icon(Icons.warning_amber_rounded, size: 11, color: Colors.redAccent),
-                            const SizedBox(width: 4),
-                            const Flexible(
-                              child: Text(
-                                "You can't revise the clip after ending the session!",
-                                style: TextStyle(fontSize: 9, color: Colors.redAccent),
-                              ),
-                            ),
-                          ],
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'Delete original clip after trim',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: _deleteOriginalAfterTrim ? Colors.redAccent : Colors.white70,
+                            fontWeight: _deleteOriginalAfterTrim ? FontWeight.bold : FontWeight.normal,
+                          ),
                         ),
-                      ),
-                  ],
-                ),
+                        if (_deleteOriginalAfterTrim)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 3),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.warning_amber_rounded, size: 11, color: Colors.redAccent),
+                                const SizedBox(width: 4),
+                                const Flexible(
+                                  child: Text(
+                                    "You can't revise the clip after ending the session!",
+                                    style: TextStyle(fontSize: 9, color: Colors.redAccent),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
           const SizedBox(height: 20),
 
@@ -2845,6 +3004,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           Center(
             child: InkWell(
               onTap: _showAboutDialog,
+              mouseCursor: SystemMouseCursors.click,
               borderRadius: BorderRadius.circular(4),
               child: const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
