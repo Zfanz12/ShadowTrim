@@ -20,6 +20,7 @@ _No items currently planned — all previously listed items have shipped in [2.1
 - **Fix "All Flagged to Delete" Workspace Bug** — Fixed a critical bug where flagging all videos for deletion without trimming any clips caused the workspace to instantly appear completely empty, instead of correctly showing 0 trimmed, 0 untrimmed, and the flagged clips. Also fixed workspace duplication when re-opening a folder in this state.
 - **Fix Mass Export Corruption Bug** — Fixed a critical issue when trimming a large batch of clips (e.g., up to 50 clips) where the trimming process would abruptly halt, files would fail to move to the "Trimmed" folder, and exports were corrupted. Resolved by adding a force-overwrite flag (`-y`) to the FFmpeg command.
 - **Smart Dynamic 3x Playback Speed** — `3.0x` playback speed is now dynamically enabled for standard videos (<= 60 FPS) where hardware decoding is smooth, but automatically capped at `2.0x` max for high-framerate clips (> 60 FPS, e.g. 120 FPS Shadowplay footage) to prevent GPU decoding bottlenecks and stuttering.
+- **~50% Application Size Reduction** — Reduced portable/installer application size from ~68MB down to ~32MB by replacing heavy native video player instances in list thumbnails with lightweight image caching, enabling aggressive Flutter AOT tree-shaking and dead code elimination.
 
 **Minor:**
 - **FilePicker COM Retry Guard** — Added retry handling for `FilePicker` dialog calls to gracefully handle transient Windows COM thread marshalling delays during folder selection.
