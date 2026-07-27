@@ -31,7 +31,7 @@ _No items currently planned — all previously listed items have shipped in [2.1
 - **App Header Rename** — Changed the main application window title from `shadowclip_trimmer` to `ShadowTrim`.
 - **About Menu Version Update** — Updated the version number displayed in the "About" menu to show correct version.
 - **Cleaned Metadata Display** — Removed the "Cut Start" and "Cut End" information from the metadata display to declutter the user interface.
-- **Detailed Quality Metadata Display** — Added a new "Quality" row in the Video Metadata card showing the video's Resolution, FPS, and Bitrate in a single line (e.g., `1920x1080 • 120 FPS • 15.0 Mbps`). Powered by background async FFprobe with a 1.5s delay to prevent disk I/O competition.
+- **Detailed Quality Metadata Display** — Added a new "Quality" row in the Video Metadata card showing the video's Resolution, FPS, and Bitrate in a single line (e.g., `1920x1080 • 120 FPS • 15.0 Mbps`).
 - **Centered Window on Launch** — The application window now opens centered on screen instead of the top-left corner.
 - **Increased Default Window Height (960px)** — Increased default window launch height to 960 pixels (1280x960) to provide ample screen real estate and eliminate UI overflow.
 
