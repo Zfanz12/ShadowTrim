@@ -34,6 +34,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   bool _isExiting = false;
   bool _isEndingSession = false;
   String _endingSessionStatus = '';
+  bool _isImporting = false;
 
   // State
   List<VideoClip> _clips = [];
@@ -72,7 +73,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     WidgetsBinding.instance.addObserver(this);
     _focusNode = FocusNode();
     _exportNameFocusNode = FocusNode();
-    _player = Player();
+    // 128MB buffer for smooth 3x playback on high-bitrate Shadowplay recordings
+    _player = Player(configuration: const PlayerConfiguration(bufferSize: 128 * 1024 * 1024));
     _controller = VideoController(_player);
 
     // Track volume position
@@ -147,6 +149,29 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     final loadPath = _viewingTrimmedMode ? (clip.trimmedOutputPath ?? clip.filePath) : clip.filePath;
     _player.open(Media(loadPath), play: false);
     _player.setRate(_playbackSpeed);
+
+    // Async FFprobe probe for quality metadata (resolution, FPS, bitrate)
+    // Delayed 1.5s so player fully loads first — avoids disk I/O competition
+    if (clip.resolution == null || clip.fps == null || clip.bitrate == null) {
+      final capturedIndex = index;
+      Future.delayed(const Duration(milliseconds: 1500), () {
+        if (!mounted || _selectedClipIndex != capturedIndex) return;
+        VideoTrimmer.probeVideoMetadata(loadPath).then((meta) {
+          if (mounted && _selectedClipIndex == capturedIndex) {
+            setState(() {
+              clip.resolution = meta['resolution'] as String?;
+              clip.fps = meta['fps'] as int?;
+              clip.bitrate = meta['bitrate'] as String?;
+              // Auto-cap speed to 2.0x max if video is high FPS (> 60fps) to prevent lag
+              if (clip.fps != null && clip.fps! > 60 && _playbackSpeed > 2.0) {
+                _playbackSpeed = 2.0;
+                _player.setRate(2.0);
+              }
+            });
+          }
+        });
+      });
+    }
 
     // Auto-scroll to keep the selected clip visible on screen
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -229,12 +254,25 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
   // Import files
   Future<void> _importFiles() async {
+    if (_isImporting) return;
+    setState(() => _isImporting = true);
     try {
-      FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['mp4', 'mkv', 'avi', 'mov'],
-        allowMultiple: true,
-      );
+      _player.pause();
+      FilePickerResult? result;
+      try {
+        result = await FilePicker.platform.pickFiles(
+          type: FileType.custom,
+          allowedExtensions: ['mp4', 'mkv', 'avi', 'mov'],
+          allowMultiple: true,
+        );
+      } catch (_) {
+        await Future.delayed(const Duration(milliseconds: 200));
+        result = await FilePicker.platform.pickFiles(
+          type: FileType.custom,
+          allowedExtensions: ['mp4', 'mkv', 'avi', 'mov'],
+          allowMultiple: true,
+        );
+      }
 
       if (result != null && result.files.isNotEmpty) {
         final firstPath = result.files.first.path;
@@ -243,13 +281,15 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           await _loadSessionBlacklist();
         }
 
-        List<VideoClip> newClips = [];
-        for (var file in result.files) {
-          if (file.path != null) {
-            final clip = await VideoClip.fromPath(file.path!);
-            newClips.add(clip);
-          }
-        }
+        // Parallel file scanning
+        final validFiles = result.files.where((f) => f.path != null).toList();
+        final newClips = await Future.wait(
+          validFiles.map((f) => VideoClip.fromPath(f.path!))
+        );
+
+        // Stop current player & clear pending thumbnail queue from previous folder
+        _player.stop();
+        VideoTrimmer.clearThumbnailQueue();
 
         setState(() {
           _clips.clear();
@@ -265,13 +305,24 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       }
     } catch (e) {
       _showSnackBar('Failed to import files: $e', isError: true);
+    } finally {
+      if (mounted) setState(() => _isImporting = false);
     }
   }
 
   // Import Folder
   Future<void> _importFolder() async {
+    if (_isImporting) return;
+    setState(() => _isImporting = true);
     try {
-      String? directoryPath = await FilePicker.platform.getDirectoryPath();
+      _player.pause();
+      String? directoryPath;
+      try {
+        directoryPath = await FilePicker.platform.getDirectoryPath();
+      } catch (_) {
+        await Future.delayed(const Duration(milliseconds: 200));
+        directoryPath = await FilePicker.platform.getDirectoryPath();
+      }
 
       if (directoryPath != null) {
         _currentWorkspacePath = directoryPath;
@@ -279,22 +330,25 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
         final dir = Directory(directoryPath);
         final List<FileSystemEntity> entities = await dir.list().toList();
-        
-        List<VideoClip> newClips = [];
-        for (var entity in entities) {
-          if (entity is File) {
-            final ext = path.extension(entity.path).toLowerCase();
-            if (['.mp4', '.mkv', '.avi', '.mov'].contains(ext)) {
-              final clip = await VideoClip.fromPath(entity.path);
-              newClips.add(clip);
-            }
-          }
-        }
 
-        if (newClips.isEmpty) {
+        final validFiles = entities.whereType<File>().where((file) {
+          final ext = path.extension(file.path).toLowerCase();
+          return ['.mp4', '.mkv', '.avi', '.mov'].contains(ext);
+        }).toList();
+
+        if (validFiles.isEmpty) {
           _showSnackBar('No valid video files found in the selected folder.', isError: false);
           return;
         }
+
+        // Parallel file scanning
+        final newClips = await Future.wait(
+          validFiles.map((file) => VideoClip.fromPath(file.path))
+        );
+
+        // Stop current player & clear pending thumbnail queue from previous folder
+        _player.stop();
+        VideoTrimmer.clearThumbnailQueue();
 
         setState(() {
           _clips.clear();
@@ -310,38 +364,52 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       }
     } catch (e) {
       _showSnackBar('Failed to import folder: $e', isError: true);
+    } finally {
+      if (mounted) setState(() => _isImporting = false);
     }
   }
 
   void _handleDroppedFiles(List<String> filePaths) async {
-    if (filePaths.isNotEmpty) {
-      _currentWorkspacePath = path.dirname(filePaths.first);
-      await _loadSessionBlacklist();
-    }
-
-    List<VideoClip> newClips = [];
-    for (var filePath in filePaths) {
-      final ext = path.extension(filePath).toLowerCase();
-      if (['.mp4', '.mkv', '.avi', '.mov'].contains(ext)) {
-        final clip = await VideoClip.fromPath(filePath);
-        newClips.add(clip);
+    if (_isImporting) return;
+    setState(() => _isImporting = true);
+    try {
+      if (filePaths.isNotEmpty) {
+        _currentWorkspacePath = path.dirname(filePaths.first);
+        await _loadSessionBlacklist();
       }
-    }
 
-    if (newClips.isNotEmpty) {
-      setState(() {
-        _clips.clear();
-        _selectedClipIndex = -1;
-        _clips.addAll(newClips);
-        _sortClips();
-      });
-      await _restoreSessionData();
-      setState(() {
-        _sortClips();
-        if (_clips.isNotEmpty) _selectClip(0);
-      });
-    } else {
-      _showSnackBar('No valid video files dropped.', isError: true);
+      final validPaths = filePaths.where((fp) {
+        final ext = path.extension(fp).toLowerCase();
+        return ['.mp4', '.mkv', '.avi', '.mov'].contains(ext);
+      }).toList();
+
+      if (validPaths.isNotEmpty) {
+        // Parallel file scanning
+        final newClips = await Future.wait(
+          validPaths.map((fp) => VideoClip.fromPath(fp))
+        );
+        // Stop current player & clear pending thumbnail queue from previous folder
+        _player.stop();
+        VideoTrimmer.clearThumbnailQueue();
+
+        setState(() {
+          _clips.clear();
+          _selectedClipIndex = -1;
+          _clips.addAll(newClips);
+          _sortClips();
+        });
+        await _restoreSessionData();
+        setState(() {
+          _sortClips();
+          if (_clips.isNotEmpty) _selectClip(0);
+        });
+      } else {
+        _showSnackBar('No valid video files dropped.', isError: true);
+      }
+    } catch (e) {
+      _showSnackBar('Failed to handle dropped files: $e', isError: true);
+    } finally {
+      if (mounted) setState(() => _isImporting = false);
     }
   }
 
@@ -403,10 +471,23 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     });
   }
 
+  List<double> get _availablePlaybackSpeeds {
+    if (_selectedClipIndex >= 0 && _selectedClipIndex < _clips.length) {
+      final activeClip = _clips[_selectedClipIndex];
+      if (activeClip.fps != null && activeClip.fps! > 60) {
+        return [0.5, 1.0, 1.5, 2.0];
+      }
+    }
+    return [0.5, 1.0, 1.5, 2.0, 3.0];
+  }
+
   void _changeSpeed(bool increase) {
-    final List<double> speeds = [0.5, 1.0, 1.5, 2.0, 3.0];
+    final List<double> speeds = _availablePlaybackSpeeds;
     int index = speeds.indexOf(_playbackSpeed);
-    if (index == -1) index = 1;
+    if (index == -1) {
+      _playbackSpeed = speeds.last;
+      index = speeds.length - 1;
+    }
 
     if (increase) {
       if (index < speeds.length - 1) {
@@ -533,9 +614,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                       const SizedBox(width: 8),
                       const Text('Save Session?', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 0.3)),
                       const Spacer(),
-                      GestureDetector(
-                        onTap: () => Navigator.pop(ctx, 'cancel'),
-                        child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                      MouseRegion(
+                        cursor: SystemMouseCursors.click,
+                        child: GestureDetector(
+                          onTap: () => Navigator.pop(ctx, 'cancel'),
+                          child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                        ),
                       ),
                     ],
                   ),
@@ -650,9 +734,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     const SizedBox(width: 8),
                     const Text('About ShadowTrim', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 0.3)),
                     const Spacer(),
-                    GestureDetector(
-                      onTap: () => Navigator.pop(ctx),
-                      child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                    MouseRegion(
+                      cursor: SystemMouseCursors.click,
+                      child: GestureDetector(
+                        onTap: () => Navigator.pop(ctx),
+                        child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                      ),
                     ),
                   ],
                 ),
@@ -672,7 +759,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     ),
                     const SizedBox(height: 8),
                     const Text(
-                      'Version : v2.0.0',
+                      'Version : v2.1.1',
                       style: TextStyle(color: Colors.grey, fontSize: 12, fontWeight: FontWeight.w500),
                     ),
                     const SizedBox(height: 24),
@@ -978,9 +1065,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                       const SizedBox(width: 8),
                       const Text('End This Session?', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 0.3)),
                       const Spacer(),
-                      GestureDetector(
-                        onTap: () => Navigator.pop(ctx, false),
-                        child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                      MouseRegion(
+                        cursor: SystemMouseCursors.click,
+                        child: GestureDetector(
+                          onTap: () => Navigator.pop(ctx, false),
+                          child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                        ),
                       ),
                     ],
                   ),
@@ -1209,9 +1299,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                       const SizedBox(width: 8),
                       const Text('Delete Clip', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 0.3)),
                       const Spacer(),
-                      GestureDetector(
-                        onTap: () => Navigator.pop(ctx, false),
-                        child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                      MouseRegion(
+                        cursor: SystemMouseCursors.click,
+                        child: GestureDetector(
+                          onTap: () => Navigator.pop(ctx, false),
+                          child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                        ),
                       ),
                     ],
                   ),
@@ -1424,7 +1517,13 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
   Future<void> _changeExportDirectory() async {
     try {
-      String? selectedDirectory = await FilePicker.platform.getDirectoryPath();
+      String? selectedDirectory;
+      try {
+        selectedDirectory = await FilePicker.platform.getDirectoryPath();
+      } catch (_) {
+        await Future.delayed(const Duration(milliseconds: 200));
+        selectedDirectory = await FilePicker.platform.getDirectoryPath();
+      }
       if (selectedDirectory != null) {
         setState(() {
           _customExportDir = selectedDirectory;
@@ -1707,7 +1806,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
           // Clip list
           Expanded(
-            child: _clips.isEmpty
+            child: _clips.isEmpty && _deletedClips.isEmpty
                 ? Center(
                     child: Padding(
                       padding: const EdgeInsets.all(24.0),
@@ -2592,7 +2691,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                                   });
                                   _player.setRate(speed);
                                 },
-                                itemBuilder: (context) => [0.5, 1.0, 1.5, 2.0, 3.0].map((speed) => PopupMenuItem<double>(
+                                 itemBuilder: (context) => _availablePlaybackSpeeds.map((speed) => PopupMenuItem<double>(
                                   value: speed,
                                   child: Text('${speed.toStringAsFixed(speed % 1 == 0 ? 0 : 1)}x', style: TextStyle(fontSize: 11, color: _playbackSpeed == speed ? const Color(0xFF76B900) : Colors.white)),
                                 )).toList(),
@@ -2890,8 +2989,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                   _buildMetadataRow('Format', path.extension(activeClip.filePath).toUpperCase().replaceAll('.', '')),
                   _buildMetadataRow('Size', activeClip.fileSizeFormatted),
                   _buildMetadataRow('Duration', _formatDuration(activeClip.duration).split('.')[0]),
-                  _buildMetadataRow('Cut Start', _formatDuration(activeClip.startCut).split('.')[0]),
-                  _buildMetadataRow('Cut End', _formatDuration(activeClip.endCut).split('.')[0]),
+                  _buildMetadataRow('Quality', activeClip.qualityString),
                   FutureBuilder<FileStat>(
                     future: File(activeClip.filePath).stat(),
                     builder: (context, snapshot) {
@@ -3292,66 +3390,35 @@ class AlignedRangeSliderTrackShape extends RoundedRectRangeSliderTrackShape {
   }
 }
 
-/// Extracts a thumbnail from a video file using a dedicated Player instance.
-class VideoThumbnailWidget extends StatefulWidget {
+/// Displays a lightweight JPEG thumbnail extracted via FFmpeg image cache.
+/// Zero native Player instances — prevents 0x8001010e COM thread crash and folder switching lag.
+class VideoThumbnailWidget extends StatelessWidget {
   final String filePath;
   const VideoThumbnailWidget({super.key, required this.filePath});
-
-  @override
-  State<VideoThumbnailWidget> createState() => _VideoThumbnailWidgetState();
-}
-
-class _VideoThumbnailWidgetState extends State<VideoThumbnailWidget> {
-  late final Player _thumbPlayer;
-  late final VideoController _thumbController;
-  bool _ready = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _thumbPlayer = Player(configuration: const PlayerConfiguration(muted: true));
-    _thumbController = VideoController(_thumbPlayer);
-    _loadFrame();
-  }
-
-  Future<void> _loadFrame() async {
-    final file = File(widget.filePath);
-    if (!await file.exists()) {
-      return;
-    }
-    await _thumbPlayer.open(Media(widget.filePath), play: false);
-    // Seek to 5% into the video for a more representative frame
-    final duration = _thumbPlayer.state.duration;
-    if (duration > Duration.zero) {
-      await _thumbPlayer.seek(Duration(milliseconds: (duration.inMilliseconds * 0.05).toInt()));
-    }
-    await Future.delayed(const Duration(milliseconds: 400));
-    if (mounted) {
-      setState(() => _ready = true);
-    }
-  }
-
-  @override
-  void dispose() {
-    _thumbPlayer.dispose();
-    super.dispose();
-  }
 
   @override
   Widget build(BuildContext context) {
     return ClipRRect(
       borderRadius: BorderRadius.circular(4),
-      child: _ready
-          ? Video(
-              controller: _thumbController,
-              controls: NoVideoControls,
-            )
-          : Container(
-              color: const Color(0xFF1A1A2E),
-              child: const Center(
-                child: Icon(Icons.video_file_outlined, size: 16, color: Colors.grey),
-              ),
+      child: FutureBuilder<File?>(
+        future: VideoTrimmer.generateThumbnail(filePath),
+        builder: (context, snapshot) {
+          if (snapshot.hasData && snapshot.data != null) {
+            return Image.file(
+              snapshot.data!,
+              fit: BoxFit.cover,
+              width: double.infinity,
+              height: double.infinity,
+            );
+          }
+          return Container(
+            color: const Color(0xFF1A1A2E),
+            child: const Center(
+              child: Icon(Icons.video_file_outlined, size: 16, color: Colors.grey),
             ),
+          );
+        },
+      ),
     );
   }
 }

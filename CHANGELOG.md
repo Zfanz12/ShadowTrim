@@ -3,9 +3,37 @@ All notable changes to ShadowTrim will be documented in this file.
 
 ## Upcoming Fixes & Features
 
-_No items currently planned — all previously listed items have shipped in [2.0.0]._
+-
 
 # Releases
+
+## [2.1.1] - 2026-07-28
+
+### Bug Fixes & Performance Enhancements
+
+**Major :**
+- **Parallel File Scanning (`Future.wait`)** — Converted file scanning from sequential (one-by-one) to parallel processing. Opening a folder now reads all clip metadata concurrently in a single pass, dramatically cutting folder import loading times.
+- **Fix Heavy Folder Switching Crash & Rate-Limited Thumbnail Queue** — Fixed a crash when opening or switching to folders containing many heavy videos (e.g., from `Downloads` to a heavy `Videos` folder). Implemented a concurrency-limited queue (max 2 concurrent FFmpeg thumbnail processes) to prevent CPU, disk I/O, and process pool exhaustion, along with automatic queue clearing and media player teardown (`_player.stop()`) when switching workspaces.
+- **Fix 0x8001010e COM Thread Error** — Replaced heavy `media_kit` `Player` instances in clip list thumbnails with a lightweight FFmpeg JPEG image cache, eliminating dozens of concurrent native background COM/D3D threads that caused Win32 `RPC_E_WRONG_THREAD` crashes.
+- **Import Safety Lock (`_isImporting`)** — Added a state lock during file/folder imports to reject new import requests while one is active, preventing race conditions, state collisions, and UI crashes.
+- **Fix "All Flagged to Delete" Workspace Bug** — Fixed a critical bug where flagging all videos for deletion without trimming any clips caused the workspace to instantly appear completely empty, instead of correctly showing 0 trimmed, 0 untrimmed, and the flagged clips. Also fixed workspace duplication when re-opening a folder in this state.
+- **Fix Mass Export Corruption Bug** — Fixed a critical issue when trimming a large batch of clips (e.g., up to 50 clips) where the trimming process would abruptly halt, files would fail to move to the "Trimmed" folder, and exports were corrupted. Resolved by adding a force-overwrite flag (`-y`) to the FFmpeg command.
+- **Smart Dynamic 3x Playback Speed** — `3.0x` playback speed is now dynamically enabled for standard videos (<= 60 FPS) where hardware decoding is smooth, but automatically capped at `2.0x` max for high-framerate clips (> 60 FPS, e.g. 120 FPS Shadowplay footage) to prevent GPU decoding bottlenecks and stuttering.
+
+**Minor :**
+- **FilePicker COM Retry Guard** — Added retry handling for `FilePicker` dialog calls to gracefully handle transient Windows COM thread marshalling delays during folder selection.
+
+### Quality of Life (QoL) & UI/UX Improvements
+
+**Minor :**
+- **App Header Rename** — Changed the main application window title from `shadowclip_trimmer` to `ShadowTrim`.
+- **About Menu Version Update** — Updated the version number displayed in the "About" menu to correctly show the version.
+- **Cleaned Metadata Display** — Removed the "Cut Start" and "Cut End" information from the metadata display to declutter the user interface.
+- **Detailed Quality Metadata Display** — Added a new "Quality" row in the Video Metadata card showing the video's Resolution, FPS, and Bitrate in a single line (e.g., `1920x1080 • 120 FPS • 15.0 Mbps`). Powered by background async FFprobe with a 1.5s delay to prevent disk I/O competition.
+- **Centered Window on Launch** — The application window now opens centered on screen instead of the top-left corner.
+- **Increased Default Window size** — Increased default window launch height.
+
+---
 
 ## [2.1.0] - 2026-07-27
 

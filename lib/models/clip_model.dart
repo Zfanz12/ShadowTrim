@@ -11,6 +11,7 @@ class VideoClip {
   Duration endCut;
   String? resolution;
   int? fps;
+  String? bitrate;
   bool isTrimmed;
   bool isAnimating;
   bool isOriginalDeleted;
@@ -30,6 +31,7 @@ class VideoClip {
     this.endCut = Duration.zero,
     this.resolution,
     this.fps,
+    this.bitrate,
     this.isTrimmed = false,
     this.isAnimating = false,
     this.isOriginalDeleted = false,
@@ -43,6 +45,14 @@ class VideoClip {
       return '${gb.toStringAsFixed(1)} GB';
     }
     return '${mb.toStringAsFixed(1)} MB';
+  }
+
+  String get qualityString {
+    final List<String> parts = [];
+    if (resolution != null && resolution!.isNotEmpty) parts.add(resolution!);
+    if (fps != null && fps! > 0) parts.add('$fps FPS');
+    if (bitrate != null && bitrate!.isNotEmpty) parts.add(bitrate!);
+    return parts.isNotEmpty ? parts.join(' • ') : 'Analyzing...';
   }
 
   // Create VideoClip from a File path
