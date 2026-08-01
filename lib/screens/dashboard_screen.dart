@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:file_selector/file_selector.dart' as file_selector;
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
@@ -12,6 +15,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:flutter_window_close/flutter_window_close.dart';
 import '../models/clip_model.dart';
 import '../services/video_service.dart';
+import '../services/logger_service.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -59,6 +63,13 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   bool _isDragging = false;
   bool _untrimmedExpanded = true;
   bool _trimmedExpanded = true;
+  bool _isMetadataExpanded = true;
+  bool _isShortcutsExpanded = false;
+  bool _isPlayerBuffering = false;
+  bool _isClipLoading = false;
+  String _importProgressStatus = '';
+  String? _currentlyLoadedMediaUrl;
+  int _selectClipToken = 0;
   String _sortBy = 'created_desc'; // 'created_desc', 'created_asc'
   double _volume = 100.0;
   double _lastVolume = 100.0;
@@ -66,6 +77,39 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   double? _draggingPositionMs;
   DateTime? _lastSeekTime;
   final Map<VideoClip, GlobalKey> _clipKeys = {};
+  final Set<String> _probingPaths = {};
+
+  void _probeClipMetadata(VideoClip clip) {
+    final targetPath = (clip.isTrimmed && clip.trimmedOutputPath != null)
+        ? clip.trimmedOutputPath!
+        : clip.filePath;
+    if (_probingPaths.contains(targetPath)) return;
+    _probingPaths.add(targetPath);
+
+    VideoTrimmer.probeVideoMetadata(targetPath).then((meta) {
+      _probingPaths.remove(targetPath);
+      if (!mounted) return;
+      final Duration? dur = meta['duration'] as Duration?;
+      setState(() {
+        if (dur != null && dur > Duration.zero && clip.duration == Duration.zero) {
+          clip.duration = dur;
+          if (clip.endCut == Duration.zero) {
+            clip.endCut = dur;
+          }
+        }
+        clip.resolution = meta['resolution'] as String? ?? clip.resolution;
+        clip.fps = meta['fps'] as int? ?? clip.fps;
+        clip.bitrate = meta['bitrate'] as String? ?? clip.bitrate;
+        // Auto-cap speed to 2.0x max if video is high FPS (> 60fps) to prevent lag
+        if (_selectedClipIndex >= 0 && _selectedClipIndex < _clips.length && _clips[_selectedClipIndex] == clip) {
+          if (clip.fps != null && clip.fps! > 60 && _playbackSpeed > 2.0) {
+            _playbackSpeed = 2.0;
+            _player.setRate(2.0);
+          }
+        }
+      });
+    });
+  }
 
   @override
   void initState() {
@@ -73,9 +117,36 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     WidgetsBinding.instance.addObserver(this);
     _focusNode = FocusNode();
     _exportNameFocusNode = FocusNode();
+    _initPlayer();
+
+    // Load last session pointer so we can show "Continue" button
+    _loadLastSessionPointer();
+
+    // Intercept native close window clicks on desktop
+    FlutterWindowClose.setWindowShouldCloseHandler(() async {
+      final response = await didRequestAppExit();
+      return response == AppExitResponse.exit;
+    });
+  }
+
+  /// Initialize a fresh Player instance with all stream listeners and mpv properties.
+  void _initPlayer() {
     // 128MB buffer for smooth 3x playback on high-bitrate Shadowplay recordings
     _player = Player(configuration: const PlayerConfiguration(bufferSize: 128 * 1024 * 1024));
     _controller = VideoController(_player);
+
+    try {
+      final platform = _player.platform as dynamic;
+      platform.setProperty('hwdec', 'auto-safe');
+      platform.setProperty('vd-lavc-dr', 'no');
+    } catch (e) {
+      debugPrint('mpv property configuration note: $e');
+    }
+
+    // Listen to internal player errors
+    _player.stream.error.listen((err) {
+      LoggerService.logError('MediaKit Player Stream Error: $err');
+    });
 
     // Track volume position
     _player.stream.volume.listen((vol) {
@@ -86,11 +157,24 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       }
     });
 
+    // Track buffering state
+    _player.stream.buffering.listen((buffering) {
+      if (mounted) {
+        setState(() {
+          _isPlayerBuffering = buffering;
+          if (!buffering) _isClipLoading = false;
+        });
+      }
+    });
+
     // Track playhead position
     _player.stream.position.listen((pos) {
       if (mounted) {
         setState(() {
           _currentPosition = pos;
+          if (_isClipLoading && pos > Duration.zero) {
+            _isClipLoading = false;
+          }
         });
       }
     });
@@ -107,15 +191,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         }
       }
     });
-
-    // Load last session pointer so we can show "Continue" button
-    _loadLastSessionPointer();
-
-    // Intercept native close window clicks on desktop
-    FlutterWindowClose.setWindowShouldCloseHandler(() async {
-      final response = await didRequestAppExit();
-      return response == AppExitResponse.exit;
-    });
   }
 
   @override
@@ -129,8 +204,9 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   }
 
   // Load a video clip into the player
-  void _selectClip(int index, {bool forceOriginal = false}) {
+  Future<void> _selectClip(int index, {bool forceOriginal = false}) async {
     if (index < 0 || index >= _clips.length) return;
+    final currentToken = ++_selectClipToken;
     final clip = _clips[index];
     setState(() {
       _selectedClipIndex = index;
@@ -147,29 +223,37 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     });
 
     final loadPath = _viewingTrimmedMode ? (clip.trimmedOutputPath ?? clip.filePath) : clip.filePath;
-    _player.open(Media(loadPath), play: false);
-    _player.setRate(_playbackSpeed);
+    LoggerService.logInfo('Selecting clip [$index]: ${clip.fileName} (Path: $loadPath)');
 
-    // Async FFprobe probe for quality metadata (resolution, FPS, bitrate)
-    // Delayed 1.5s so player fully loads first — avoids disk I/O competition
-    if (clip.resolution == null || clip.fps == null || clip.bitrate == null) {
+    if (_currentlyLoadedMediaUrl == loadPath) {
+      LoggerService.logInfo('Media is already active in player: $loadPath. Seeking to start.');
+      try {
+        await _player.seek(Duration.zero);
+        await _player.pause();
+      } catch (e) {
+        debugPrint('Failed to seek active media: $e');
+      }
+    } else {
+      try {
+        if (!mounted || currentToken != _selectClipToken) {
+          LoggerService.logInfo('Aborting stale media load token $currentToken (latest is $_selectClipToken)');
+          return;
+        }
+        _currentlyLoadedMediaUrl = loadPath;
+        await _player.open(Media(loadPath), play: false);
+        if (!mounted || currentToken != _selectClipToken) return;
+        await _player.setRate(_playbackSpeed);
+      } catch (e, stack) {
+        LoggerService.logError('Player failed to open media $loadPath: $e', stack);
+      }
+    }
+
+    // Async FFprobe probe for quality metadata (resolution, FPS, bitrate, duration)
+    if (clip.resolution == null || clip.fps == null || clip.bitrate == null || clip.duration == Duration.zero) {
       final capturedIndex = index;
-      Future.delayed(const Duration(milliseconds: 1500), () {
+      Future.delayed(const Duration(milliseconds: 300), () {
         if (!mounted || _selectedClipIndex != capturedIndex) return;
-        VideoTrimmer.probeVideoMetadata(loadPath).then((meta) {
-          if (mounted && _selectedClipIndex == capturedIndex) {
-            setState(() {
-              clip.resolution = meta['resolution'] as String?;
-              clip.fps = meta['fps'] as int?;
-              clip.bitrate = meta['bitrate'] as String?;
-              // Auto-cap speed to 2.0x max if video is high FPS (> 60fps) to prevent lag
-              if (clip.fps != null && clip.fps! > 60 && _playbackSpeed > 2.0) {
-                _playbackSpeed = 2.0;
-                _player.setRate(2.0);
-              }
-            });
-          }
-        });
+        _probeClipMetadata(clip);
       });
     }
 
@@ -252,126 +336,206 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     }
   }
 
+  Future<List<VideoClip>> _scanClipsInBatches(List<String> filePaths) async {
+    final List<VideoClip> result = [];
+    const int batchSize = 25;
+    final total = filePaths.length;
+
+    for (int i = 0; i < total; i += batchSize) {
+      final end = (i + batchSize < total) ? i + batchSize : total;
+      final currentBatch = filePaths.sublist(i, end);
+
+      final batchClips = await Future.wait(
+        currentBatch.map((fp) => VideoClip.fromPath(fp))
+      );
+      result.addAll(batchClips);
+
+      if (mounted) {
+        setState(() {
+          _importProgressStatus = 'Importing video clips ($end / $total)...';
+        });
+        // Yield execution to the Flutter engine & OS event loop so UI stays 100% responsive
+        await Future.delayed(const Duration(milliseconds: 1));
+      }
+    }
+    return result;
+  }
+
   // Import files
   Future<void> _importFiles() async {
     if (_isImporting) return;
-    setState(() => _isImporting = true);
     try {
-      _player.pause();
-      FilePickerResult? result;
+      if (_clips.isNotEmpty) {
+        _player.pause();
+      }
+      List<String> validFilePaths = [];
       try {
-        result = await FilePicker.platform.pickFiles(
-          type: FileType.custom,
-          allowedExtensions: ['mp4', 'mkv', 'avi', 'mov'],
-          allowMultiple: true,
+        final typeGroup = file_selector.XTypeGroup(
+          label: 'Videos',
+          extensions: ['mp4', 'mkv', 'avi', 'mov'],
         );
-      } catch (_) {
-        await Future.delayed(const Duration(milliseconds: 200));
-        result = await FilePicker.platform.pickFiles(
-          type: FileType.custom,
-          allowedExtensions: ['mp4', 'mkv', 'avi', 'mov'],
-          allowMultiple: true,
-        );
+        final files = await file_selector.openFiles(acceptedTypeGroups: [typeGroup]);
+        validFilePaths = files.map((f) => f.path).toList();
+      } catch (e, stack) {
+        LoggerService.logError('file_selector openFiles error: $e', stack);
       }
 
-      if (result != null && result.files.isNotEmpty) {
-        final firstPath = result.files.first.path;
-        if (firstPath != null) {
-          _currentWorkspacePath = path.dirname(firstPath);
-          await _loadSessionBlacklist();
-        }
+      if (validFilePaths.isNotEmpty) {
+        // Show loading overlay IMMEDIATELY after user confirms selection
+        setState(() {
+          _isImporting = true;
+          _importProgressStatus = 'Preparing to import ${validFilePaths.length} clips...';
+        });
+        // Paint loading overlay immediately before processing
+        await Future.delayed(const Duration(milliseconds: 50));
 
-        // Parallel file scanning
-        final validFiles = result.files.where((f) => f.path != null).toList();
-        final newClips = await Future.wait(
-          validFiles.map((f) => VideoClip.fromPath(f.path!))
-        );
+        final firstPath = validFilePaths.first;
+        _currentWorkspacePath = path.dirname(firstPath);
+        await _loadSessionBlacklist();
 
-        // Stop current player & clear pending thumbnail queue from previous folder
-        _player.stop();
+        LoggerService.logInfo('Importing ${validFilePaths.length} files from workspace: $_currentWorkspacePath');
+
+        // Batched parallel file scanning with UI yielding
+        final newClips = await _scanClipsInBatches(validFilePaths);
+
+        // Pause player & clear pending thumbnail queue for clean workspace switch
+        try {
+          await _player.pause();
+        } catch (_) {}
         VideoTrimmer.clearThumbnailQueue();
 
         setState(() {
           _clips.clear();
           _selectedClipIndex = -1;
+          _currentlyLoadedMediaUrl = null;
           _clips.addAll(newClips);
           _sortClips();
         });
         await _restoreSessionData();
         setState(() {
           _sortClips();
-          if (_clips.isNotEmpty) _selectClip(0);
         });
+        if (_clips.isNotEmpty) {
+          await _selectClip(0);
+        }
       }
-    } catch (e) {
+    } catch (e, stack) {
+      LoggerService.logError('Failed to import files: $e', stack);
       _showSnackBar('Failed to import files: $e', isError: true);
     } finally {
-      if (mounted) setState(() => _isImporting = false);
+      if (mounted) {
+        setState(() {
+          _isImporting = false;
+          _importProgressStatus = '';
+        });
+      }
     }
   }
 
   // Import Folder
   Future<void> _importFolder() async {
     if (_isImporting) return;
-    setState(() => _isImporting = true);
     try {
-      _player.pause();
+      if (_clips.isNotEmpty) {
+        _player.pause();
+      }
       String? directoryPath;
       try {
-        directoryPath = await FilePicker.platform.getDirectoryPath();
-      } catch (_) {
-        await Future.delayed(const Duration(milliseconds: 200));
-        directoryPath = await FilePicker.platform.getDirectoryPath();
+        directoryPath = await file_selector.getDirectoryPath();
+      } catch (e, stack) {
+        LoggerService.logError('file_selector getDirectoryPath error: $e', stack);
       }
 
       if (directoryPath != null) {
+        // Show loading overlay IMMEDIATELY after user confirms folder selection
+        setState(() {
+          _isImporting = true;
+          _importProgressStatus = 'Opening workspace folder...';
+        });
+        // Paint loading overlay immediately before disk operations
+        await Future.delayed(const Duration(milliseconds: 50));
+
         _currentWorkspacePath = directoryPath;
+        LoggerService.logInfo('Opening workspace folder: $directoryPath');
+
         await _loadSessionBlacklist();
 
         final dir = Directory(directoryPath);
-        final List<FileSystemEntity> entities = await dir.list().toList();
+        final List<String> validFilePaths = [];
 
-        final validFiles = entities.whereType<File>().where((file) {
-          final ext = path.extension(file.path).toLowerCase();
-          return ['.mp4', '.mkv', '.avi', '.mov'].contains(ext);
-        }).toList();
+        int scannedCount = 0;
+        await for (final entity in dir.list(followLinks: false)) {
+          scannedCount++;
+          if (entity is File) {
+            final ext = path.extension(entity.path).toLowerCase();
+            if (['.mp4', '.mkv', '.avi', '.mov'].contains(ext)) {
+              validFilePaths.add(entity.path);
+            }
+          }
+          if (scannedCount % 100 == 0 && mounted) {
+            setState(() {
+              _importProgressStatus = 'Scanning directory... (${validFilePaths.length} videos found)';
+            });
+            await Future.delayed(const Duration(milliseconds: 1));
+          }
+        }
 
-        if (validFiles.isEmpty) {
+        if (validFilePaths.isEmpty) {
           _showSnackBar('No valid video files found in the selected folder.', isError: false);
           return;
         }
 
-        // Parallel file scanning
-        final newClips = await Future.wait(
-          validFiles.map((file) => VideoClip.fromPath(file.path))
-        );
+        setState(() {
+          _importProgressStatus = 'Found ${validFilePaths.length} videos. Importing...';
+        });
+        await Future.delayed(const Duration(milliseconds: 20));
 
-        // Stop current player & clear pending thumbnail queue from previous folder
-        _player.stop();
+        // Batched parallel file scanning with UI yielding
+        final newClips = await _scanClipsInBatches(validFilePaths);
+
+        // Pause player & clear pending thumbnail queue for clean workspace switch
+        try {
+          await _player.pause();
+        } catch (_) {}
         VideoTrimmer.clearThumbnailQueue();
 
         setState(() {
           _clips.clear();
           _selectedClipIndex = -1;
+          _currentlyLoadedMediaUrl = null;
           _clips.addAll(newClips);
           _sortClips();
         });
         await _restoreSessionData();
         setState(() {
           _sortClips();
-          if (_clips.isNotEmpty) _selectClip(0);
         });
+        if (_clips.isNotEmpty) {
+          await _selectClip(0);
+        }
       }
-    } catch (e) {
+    } catch (e, stack) {
+      LoggerService.logError('Failed to import folder: $e', stack);
       _showSnackBar('Failed to import folder: $e', isError: true);
     } finally {
-      if (mounted) setState(() => _isImporting = false);
+      if (mounted) {
+        setState(() {
+          _isImporting = false;
+          _importProgressStatus = '';
+        });
+      }
     }
   }
 
   void _handleDroppedFiles(List<String> filePaths) async {
     if (_isImporting) return;
-    setState(() => _isImporting = true);
+    setState(() {
+      _isImporting = true;
+      _importProgressStatus = 'Processing dropped items...';
+    });
+    // Paint loading overlay immediately before file scanning
+    await Future.delayed(const Duration(milliseconds: 50));
+
     try {
       if (filePaths.isNotEmpty) {
         _currentWorkspacePath = path.dirname(filePaths.first);
@@ -384,32 +548,46 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       }).toList();
 
       if (validPaths.isNotEmpty) {
-        // Parallel file scanning
-        final newClips = await Future.wait(
-          validPaths.map((fp) => VideoClip.fromPath(fp))
-        );
-        // Stop current player & clear pending thumbnail queue from previous folder
-        _player.stop();
+        LoggerService.logInfo('Dropped ${validPaths.length} files into workspace');
+        setState(() {
+          _importProgressStatus = 'Importing ${validPaths.length} dropped clips...';
+        });
+        // Batched parallel file scanning with UI yielding
+        final newClips = await _scanClipsInBatches(validPaths);
+
+        // Pause player & clear pending thumbnail queue for clean workspace switch
+        try {
+          await _player.pause();
+        } catch (_) {}
         VideoTrimmer.clearThumbnailQueue();
 
         setState(() {
           _clips.clear();
           _selectedClipIndex = -1;
+          _currentlyLoadedMediaUrl = null;
           _clips.addAll(newClips);
           _sortClips();
         });
         await _restoreSessionData();
         setState(() {
           _sortClips();
-          if (_clips.isNotEmpty) _selectClip(0);
         });
+        if (_clips.isNotEmpty) {
+          await _selectClip(0);
+        }
       } else {
         _showSnackBar('No valid video files dropped.', isError: true);
       }
-    } catch (e) {
+    } catch (e, stack) {
+      LoggerService.logError('Failed to handle dropped files: $e', stack);
       _showSnackBar('Failed to handle dropped files: $e', isError: true);
     } finally {
-      if (mounted) setState(() => _isImporting = false);
+      if (mounted) {
+        setState(() {
+          _isImporting = false;
+          _importProgressStatus = '';
+        });
+      }
     }
   }
 
@@ -475,10 +653,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     if (_selectedClipIndex >= 0 && _selectedClipIndex < _clips.length) {
       final activeClip = _clips[_selectedClipIndex];
       if (activeClip.fps != null && activeClip.fps! > 60) {
-        return [0.5, 1.0, 1.5, 2.0];
+        return [0.25, 0.5, 1.0, 1.5, 2.0];
       }
     }
-    return [0.5, 1.0, 1.5, 2.0, 3.0];
+    return [0.25, 0.5, 1.0, 1.5, 2.0, 3.0];
   }
 
   void _changeSpeed(bool increase) {
@@ -759,7 +937,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     ),
                     const SizedBox(height: 8),
                     const Text(
-                      'Version : v2.1.1',
+                      'Version : v2.1.2',
                       style: TextStyle(color: Colors.grey, fontSize: 12, fontWeight: FontWeight.w500),
                     ),
                     const SizedBox(height: 24),
@@ -783,6 +961,23 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                       label: 'Buy me a Roti-O',
                       color: const Color(0xFFFF5E5B),
                       url: 'https://ko-fi.com/S4Y52325J2',
+                    ),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          LoggerService.openLogFolder();
+                        },
+                        icon: const Icon(Icons.bug_report_outlined, size: 16, color: Color(0xFF76B900)),
+                        label: const Text('View Crash Logs', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF76B900))),
+                        style: OutlinedButton.styleFrom(
+                          side: BorderSide(color: const Color(0xFF76B900).withOpacity(0.5)),
+                          padding: const EdgeInsets.symmetric(vertical: 11),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                      ),
                     ),
                   ],
                 ),
@@ -820,14 +1015,37 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   Future<void> _launchUrl(String url) async {
     try {
       if (Platform.isWindows) {
-        await Process.run('cmd', ['/c', 'start', url.replaceAll('&', '^&')]);
+        await Process.start('cmd', ['/c', 'start', url.replaceAll('&', '^&')], mode: ProcessStartMode.detached);
       } else if (Platform.isMacOS) {
-        await Process.run('open', [url]);
+        await Process.start('open', [url], mode: ProcessStartMode.detached);
       } else if (Platform.isLinux) {
-        await Process.run('xdg-open', [url]);
+        await Process.start('xdg-open', [url], mode: ProcessStartMode.detached);
       }
     } catch (e) {
       debugPrint('Failed to launch URL: $e');
+    }
+  }
+
+  void _openInExplorer(String path, {bool select = false}) {
+    try {
+      if (Platform.isWindows) {
+        if (select) {
+          Process.start('explorer', ['/select,', path], mode: ProcessStartMode.detached);
+        } else {
+          Process.start('explorer', [path], mode: ProcessStartMode.detached);
+        }
+      } else if (Platform.isMacOS) {
+        if (select) {
+          Process.start('open', ['-R', path], mode: ProcessStartMode.detached);
+        } else {
+          Process.start('open', [path], mode: ProcessStartMode.detached);
+        }
+      } else if (Platform.isLinux) {
+        final dirPath = select ? File(path).parent.path : path;
+        Process.start('xdg-open', [dirPath], mode: ProcessStartMode.detached);
+      }
+    } catch (e) {
+      debugPrint('Failed to open explorer: $e');
     }
   }
 
@@ -926,14 +1144,17 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       final List<VideoClip> restoredDeleted = [];
       for (final d in savedDeleted) {
         final fp = d['filePath'] as String;
-        if (File(fp).existsSync()) {
+        final file = File(fp);
+        if (await file.exists()) {
+          final length = await file.length();
+          final stat = await file.stat();
           restoredDeleted.add(VideoClip(
             filePath: fp,
             fileName: d['fileName'] as String? ?? path.basename(fp),
             originalFileName: d['originalFileName'] as String? ?? path.basename(fp),
-            fileSizeBytes: File(fp).lengthSync(),
-            dateModified: File(fp).lastModifiedSync(),
-            dateCreated: File(fp).lastModifiedSync(),
+            fileSizeBytes: length,
+            dateModified: stat.modified,
+            dateCreated: stat.changed,
           ));
         }
       }
@@ -1020,6 +1241,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       if (_clips.isNotEmpty) _selectClip(0);
     });
   }
+
+
 
   // ── End Session Dialog & Cleanup Loading Indicator ────────────────────────
 
@@ -1189,7 +1412,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             _originalClipsToDelete.clear();
             _isEndingSession = false;
           });
-          _player.stop();
+          _player.pause();
           ScaffoldMessenger.of(context).hideCurrentSnackBar();
           _showSnackBar('Session ended cleanly.');
         }
@@ -1402,7 +1625,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         if (_selectedClipIndex >= 0) {
           _selectClip(_selectedClipIndex);
         } else if (_clips.isEmpty) {
-          _player.stop();
+          _player.pause();
           _selectedClipIndex = -1;
         }
       });
@@ -1506,7 +1729,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       }
 
       _showSnackBar('Export Success: $customOutputPath');
-    } catch (e) {
+    } catch (e, stack) {
+      LoggerService.logError('Export Failed: $e', stack);
       _showSnackBar('Export Failed: $e', isError: true);
     } finally {
       setState(() {
@@ -1519,10 +1743,9 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     try {
       String? selectedDirectory;
       try {
-        selectedDirectory = await FilePicker.platform.getDirectoryPath();
-      } catch (_) {
-        await Future.delayed(const Duration(milliseconds: 200));
-        selectedDirectory = await FilePicker.platform.getDirectoryPath();
+        selectedDirectory = await file_selector.getDirectoryPath();
+      } catch (e, stack) {
+        LoggerService.logError('file_selector getDirectoryPath error: $e', stack);
       }
       if (selectedDirectory != null) {
         setState(() {
@@ -1707,6 +1930,25 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                         borderRadius: BorderRadius.circular(6),
                         side: const BorderSide(color: Color(0xFF2E2E3E)),
                       ),
+                    ).copyWith(
+                      backgroundColor: WidgetStateProperty.resolveWith((states) {
+                        if (states.contains(WidgetState.hovered)) {
+                          return const Color(0xFF252636);
+                        }
+                        return const Color(0xFF1E1E2E);
+                      }),
+                      foregroundColor: WidgetStateProperty.resolveWith((states) {
+                        if (states.contains(WidgetState.hovered)) {
+                          return const Color(0xFF76B900);
+                        }
+                        return Colors.white;
+                      }),
+                      side: WidgetStateProperty.resolveWith((states) {
+                        if (states.contains(WidgetState.hovered)) {
+                          return const BorderSide(color: Color(0xFF76B900), width: 1);
+                        }
+                        return const BorderSide(color: Color(0xFF2E2E3E));
+                      }),
                     ),
                   ),
                 ),
@@ -1725,6 +1967,25 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                         borderRadius: BorderRadius.circular(6),
                         side: const BorderSide(color: Color(0xFF2E2E3E)),
                       ),
+                    ).copyWith(
+                      backgroundColor: WidgetStateProperty.resolveWith((states) {
+                        if (states.contains(WidgetState.hovered)) {
+                          return const Color(0xFF252636);
+                        }
+                        return const Color(0xFF1E1E2E);
+                      }),
+                      foregroundColor: WidgetStateProperty.resolveWith((states) {
+                        if (states.contains(WidgetState.hovered)) {
+                          return const Color(0xFF76B900);
+                        }
+                        return Colors.white;
+                      }),
+                      side: WidgetStateProperty.resolveWith((states) {
+                        if (states.contains(WidgetState.hovered)) {
+                          return const BorderSide(color: Color(0xFF76B900), width: 1);
+                        }
+                        return const BorderSide(color: Color(0xFF2E2E3E));
+                      }),
                     ),
                   ),
                 ),
@@ -1754,14 +2015,15 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     if (_currentWorkspacePath != null) ...[
-                      IconButton(
-                        icon: const Icon(Icons.folder_open, size: 14, color: Colors.grey),
+                      HoverIconButton(
+                        icon: Icons.folder_open,
+                        size: 14,
+                        defaultColor: Colors.grey,
+                        hoverColor: const Color(0xFF76B900),
                         tooltip: 'Open Workspace Folder in File Explorer',
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(),
                         onPressed: () {
                           if (_currentWorkspacePath != null) {
-                            Process.run('explorer', [_currentWorkspacePath!]);
+                            _openInExplorer(_currentWorkspacePath!);
                           }
                         },
                       ),
@@ -2024,6 +2286,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   }
 
   Widget _buildClipTile(VideoClip clip) {
+    if (clip.duration == Duration.zero) {
+      _probeClipMetadata(clip);
+    }
+
     final int idx = _clips.indexOf(clip);
     final isSelected = idx == _selectedClipIndex;
     
@@ -2179,30 +2445,34 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                             ),
                             const SizedBox(width: 8),
                           ],
-                          IconButton(
-                            icon: const Icon(Icons.folder_open, size: 14, color: Colors.grey),
+                          HoverIconButton(
+                            icon: Icons.folder_open,
+                            size: 14,
+                            defaultColor: Colors.grey,
+                            hoverColor: const Color(0xFF76B900),
                             tooltip: 'Reveal in File Explorer',
-                            padding: EdgeInsets.zero,
-                            constraints: const BoxConstraints(),
                             onPressed: () {
                               final revealPath = (clip.isTrimmed && clip.trimmedOutputPath != null)
                                   ? clip.trimmedOutputPath!
                                   : clip.filePath;
-                              Process.run('explorer', ['/select,', revealPath]);
+                              _openInExplorer(revealPath, select: true);
                             },
                           ),
-                          const SizedBox(width: 8),
-                          IconButton(
-                            icon: const Icon(Icons.close, size: 14, color: Colors.grey),
+                          const SizedBox(width: 4),
+                          HoverIconButton(
+                            icon: Icons.close,
+                            size: 14,
+                            defaultColor: Colors.grey,
+                            hoverColor: Colors.redAccent,
+                            hoverBgColor: Colors.redAccent.withValues(alpha: 0.25),
+                            enableSpin: true,
                             tooltip: 'Remove from list',
-                            padding: EdgeInsets.zero,
-                            constraints: const BoxConstraints(),
                             onPressed: () {
                               setState(() {
                                 _clips.removeAt(idx);
                                 if (_selectedClipIndex == idx) {
                                     _selectedClipIndex = -1;
-                                    _player.open(Media(''), play: false);
+                                    _player.pause();
                                     if (_clips.isNotEmpty) {
                                       _selectClip(0);
                                     }
@@ -2261,8 +2531,21 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(8),
-                      side: BorderSide(color: const Color(0xFF76B900).withOpacity(0.5)),
+                      side: BorderSide(color: const Color(0xFF76B900).withValues(alpha: 0.5)),
                     ),
+                  ).copyWith(
+                    backgroundColor: WidgetStateProperty.resolveWith((states) {
+                      if (states.contains(WidgetState.hovered)) {
+                        return const Color(0xFF27293D);
+                      }
+                      return const Color(0xFF1E1E2E);
+                    }),
+                    side: WidgetStateProperty.resolveWith((states) {
+                      if (states.contains(WidgetState.hovered)) {
+                        return const BorderSide(color: Color(0xFF76B900), width: 1.5);
+                      }
+                      return BorderSide(color: const Color(0xFF76B900).withValues(alpha: 0.5));
+                    }),
                   ),
                 ),
               ],
@@ -2405,6 +2688,19 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               );
             }
             return KeyEventResult.handled;
+          } else if (event.logicalKey == LogicalKeyboardKey.f12 ||
+              (event.logicalKey == LogicalKeyboardKey.keyI &&
+                  isShiftPressed &&
+                  HardwareKeyboard.instance.isControlPressed)) {
+            setState(() {
+              debugPaintSizeEnabled = !debugPaintSizeEnabled;
+            });
+            _showSnackBar(
+              debugPaintSizeEnabled
+                  ? 'Inspect Bounding Box Enabled (F12)'
+                  : 'Inspect Bounding Box Disabled',
+            );
+            return KeyEventResult.handled;
           }
         }
         return KeyEventResult.ignored;
@@ -2415,20 +2711,87 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           children: [
             // Large Video Container
             Expanded(
-              child: Center(
-                child: GestureDetector(
-                  onTap: () {
-                    if (_player.state.playing) {
-                      _player.pause();
-                    } else {
-                      _player.play();
-                    }
-                    _focusNode.requestFocus();
-                  },
-                  child: Video(
-                    controller: _controller,
-                    controls: NoVideoControls,
-                  ),
+              child: Container(
+                color: Colors.black,
+                child: Stack(
+                  children: [
+                    Center(
+                      child: GestureDetector(
+                        onTap: () {
+                          if (_isImporting) return;
+                          if (_player.state.playing) {
+                            _player.pause();
+                          } else {
+                            _player.play();
+                          }
+                          _focusNode.requestFocus();
+                        },
+                        child: Video(
+                          controller: _controller,
+                          controls: NoVideoControls,
+                        ),
+                      ),
+                    ),
+                    if (_isImporting)
+                      Positioned.fill(
+                        child: Container(
+                          color: const Color(0xE60D0E15),
+                          child: Center(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 22),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF14151F),
+                                borderRadius: BorderRadius.circular(14),
+                                border: Border.all(
+                                  color: const Color(0xFF76B900).withValues(alpha: 0.3),
+                                  width: 1.5,
+                                ),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.5),
+                                    blurRadius: 20,
+                                    spreadRadius: 2,
+                                  ),
+                                ],
+                              ),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  const SizedBox(
+                                    width: 42,
+                                    height: 42,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 3.5,
+                                      color: Color(0xFF76B900),
+                                      backgroundColor: Color(0xFF222433),
+                                    ),
+                                  ),
+                                  const SizedBox(height: 18),
+                                  Text(
+                                    _importProgressStatus.isNotEmpty ? _importProgressStatus : 'Importing workspace folder...',
+                                    style: const TextStyle(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.white,
+                                      letterSpacing: 0.5,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    'Parsing video clips & building thumbnail cache',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: Colors.grey.shade400,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
               ),
             ),
@@ -2603,6 +2966,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                               IconButton(
                                 icon: const Icon(Icons.first_page, color: Color(0xFF76B900)),
                                 tooltip: 'Jump to Start Cut (Shift+J)',
+                                hoverColor: const Color(0xFF76B900).withValues(alpha: 0.15),
                                 onPressed: () {
                                   if (activeClip != null) {
                                     _player.seek(activeClip.startCut);
@@ -2612,6 +2976,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                               const SizedBox(width: 4),
                               IconButton(
                                 icon: const Icon(Icons.replay_5, color: Colors.grey),
+                                tooltip: 'Seek -5s (J)',
+                                hoverColor: Colors.white12,
                                 onPressed: () {
                                   final newPos = _currentPosition - const Duration(seconds: 5);
                                   _player.seek(newPos < Duration.zero ? Duration.zero : newPos);
@@ -2629,6 +2995,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                                     final isPlaying = snapshot.data ?? false;
                                     return IconButton(
                                       icon: Icon(isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
+                                      hoverColor: Colors.white24,
                                       onPressed: () {
                                         if (isPlaying) {
                                           _player.pause();
@@ -2643,6 +3010,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                               const SizedBox(width: 8),
                               IconButton(
                                 icon: const Icon(Icons.forward_5, color: Colors.grey),
+                                tooltip: 'Seek +5s (L)',
+                                hoverColor: Colors.white12,
                                 onPressed: () {
                                   final newPos = _currentPosition + const Duration(seconds: 5);
                                   _player.seek(newPos > duration ? duration : newPos);
@@ -2652,6 +3021,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                               IconButton(
                                 icon: const Icon(Icons.last_page, color: Colors.redAccent),
                                 tooltip: 'Jump to End Cut (Shift+L)',
+                                hoverColor: Colors.redAccent.withValues(alpha: 0.15),
                                 onPressed: () {
                                   if (activeClip != null) {
                                     _player.seek(activeClip.endCut);
@@ -2670,19 +3040,31 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              // Playback speed selector
+                              // Playback speed selector with hover effect & 0.25x support
                               PopupMenuButton<double>(
                                 tooltip: 'Playback Speed (< or >)',
-                                offset: const Offset(0, -175),
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                                offset: const Offset(0, -195),
+                                borderRadius: BorderRadius.circular(6),
+                                color: const Color(0xFF1E1E2E),
+                                child: Ink(
+                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                                   decoration: BoxDecoration(
+                                    color: const Color(0xFF161622),
                                     border: Border.all(color: Colors.grey.shade800),
                                     borderRadius: BorderRadius.circular(4),
                                   ),
-                                  child: Text(
-                                    '${_playbackSpeed.toStringAsFixed(_playbackSpeed % 1 == 0 ? 0 : 1)}x',
-                                    style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.white70),
+                                  child: InkWell(
+                                    borderRadius: BorderRadius.circular(4),
+                                    hoverColor: const Color(0xFF76B900).withValues(alpha: 0.15),
+                                    child: Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 1),
+                                      child: Text(
+                                        _playbackSpeed == 0.25
+                                            ? '0.25x'
+                                            : '${_playbackSpeed.toStringAsFixed(_playbackSpeed % 1 == 0 ? 0 : 1)}x',
+                                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white70),
+                                      ),
+                                    ),
                                   ),
                                 ),
                                 onSelected: (speed) {
@@ -2691,22 +3073,26 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                                   });
                                   _player.setRate(speed);
                                 },
-                                 itemBuilder: (context) => _availablePlaybackSpeeds.map((speed) => PopupMenuItem<double>(
+                                itemBuilder: (context) => _availablePlaybackSpeeds.map((speed) => PopupMenuItem<double>(
                                   value: speed,
-                                  child: Text('${speed.toStringAsFixed(speed % 1 == 0 ? 0 : 1)}x', style: TextStyle(fontSize: 11, color: _playbackSpeed == speed ? const Color(0xFF76B900) : Colors.white)),
+                                  child: Text(
+                                    speed == 0.25 ? '0.25x' : '${speed.toStringAsFixed(speed % 1 == 0 ? 0 : 1)}x',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: _playbackSpeed == speed ? FontWeight.bold : FontWeight.normal,
+                                      color: _playbackSpeed == speed ? const Color(0xFF76B900) : Colors.white,
+                                    ),
+                                  ),
                                 )).toList(),
                               ),
                               const SizedBox(width: 10),
-                              MouseRegion(
-                                cursor: SystemMouseCursors.click,
-                                child: GestureDetector(
-                                  onTap: _toggleMute,
-                                  child: Icon(
-                                    _volume == 0 ? Icons.volume_off : (_volume < 50 ? Icons.volume_down : Icons.volume_up),
-                                    size: 14,
-                                    color: _volume == 0 ? Colors.redAccent : Colors.grey.shade500,
-                                  ),
-                                ),
+                              HoverIconButton(
+                                icon: _volume == 0 ? Icons.volume_off : (_volume < 50 ? Icons.volume_down : Icons.volume_up),
+                                size: 15,
+                                defaultColor: _volume == 0 ? Colors.redAccent : Colors.grey.shade400,
+                                hoverColor: const Color(0xFF76B900),
+                                tooltip: _volume == 0 ? 'Unmute (M)' : 'Mute (M)',
+                                onPressed: _toggleMute,
                               ),
                               const SizedBox(width: 4),
                               SizedBox(
@@ -2753,201 +3139,354 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     return Container(
       width: 250,
       color: const Color(0xFF11111B),
-      padding: const EdgeInsets.all(16.0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Text(
-            'TRIMMING & METADATA',
-            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.grey),
-          ),
-          const SizedBox(height: 16),
-          
-          // Export name input
-          const Text(
-            'Export File Name',
-            style: TextStyle(fontSize: 11, color: Colors.white70),
-          ),
-          const SizedBox(height: 6),
-          TextField(
-            controller: _exportNameController,
-            focusNode: _exportNameFocusNode,
-            enabled: activeClip != null,
-            style: const TextStyle(fontSize: 12),
-            onSubmitted: (_) {
-              _focusNode.requestFocus();
-            },
-            decoration: InputDecoration(
-              isDense: true,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-              filled: true,
-              fillColor: const Color(0xFF1E1E2E),
-              hintText: 'Enter file name',
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(6),
-                borderSide: BorderSide.none,
-              ),
-              suffixText: activeClip != null ? path.extension(activeClip.filePath) : '',
-              suffixStyle: const TextStyle(color: Colors.grey, fontSize: 11),
-            ),
-          ),
-          const SizedBox(height: 16),
-
-          // Destination Info Card
-          const Text(
-            'Export Destination',
-            style: TextStyle(fontSize: 11, color: Colors.white70),
-          ),
-          const SizedBox(height: 6),
-          InkWell(
-            onTap: _changeExportDirectory,
-            mouseCursor: SystemMouseCursors.click,
-            borderRadius: BorderRadius.circular(6),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1E1E2E),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(
-                  color: _customExportDir != null ? const Color(0xFF76B900).withOpacity(0.5) : Colors.transparent,
-                  width: 1,
-                ),
-              ),
-              child: Row(
+          // Top scrollable settings & metadata area
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Icon(Icons.folder_open, size: 16, color: Color(0xFF76B900)),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      _getExportDirectoryPath(activeClip),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 10, color: Colors.grey.shade400, fontFamily: 'monospace'),
+                  const Text(
+                    'TRIMMING & METADATA',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.grey),
+                  ),
+                  const SizedBox(height: 16),
+                  
+                  // Export name input
+                  const Text(
+                    'Export File Name',
+                    style: TextStyle(fontSize: 11, color: Colors.white70),
+                  ),
+                  const SizedBox(height: 6),
+                  TextField(
+                    controller: _exportNameController,
+                    focusNode: _exportNameFocusNode,
+                    enabled: activeClip != null,
+                    style: const TextStyle(fontSize: 12),
+                    onSubmitted: (_) {
+                      _focusNode.requestFocus();
+                    },
+                    decoration: InputDecoration(
+                      isDense: true,
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                      filled: true,
+                      fillColor: const Color(0xFF1E1E2E),
+                      hintText: 'Enter file name',
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(6),
+                        borderSide: BorderSide.none,
+                      ),
+                      suffixText: activeClip != null ? path.extension(activeClip.filePath) : '',
+                      suffixStyle: const TextStyle(color: Colors.grey, fontSize: 11),
                     ),
                   ),
-                  if (activeClip != null || _customExportDir != null)
-                    IconButton(
-                      icon: const Icon(Icons.open_in_new, size: 14, color: Colors.grey),
-                      padding: EdgeInsets.zero,
-                      constraints: const BoxConstraints(),
-                      onPressed: () {
-                        final dir = _getExportDirectoryPath(activeClip);
-                        Process.run('explorer', [dir]);
-                      },
-                      tooltip: 'Open in File Explorer',
-                    )
-                ],
-              ),
-            ),
-          ),
-          if (_customExportDir != null) ...[
-            const SizedBox(height: 4),
-            Align(
-              alignment: Alignment.centerRight,
-              child: InkWell(
-                onTap: () => setState(() => _customExportDir = null),
-                mouseCursor: SystemMouseCursors.click,
-                child: const Text(
-                  'Reset to source folder',
-                  style: TextStyle(fontSize: 10, color: Colors.grey, decoration: TextDecoration.underline),
-                ),
-              ),
-            ),
-          ],
-          const SizedBox(height: 12),
+                  const SizedBox(height: 16),
 
-          // Automatically add Trimmed folder checkbox
-          MouseRegion(
-            cursor: SystemMouseCursors.click,
-            child: GestureDetector(
-              onTap: () {
-                setState(() {
-                  _autoCreateTrimmedFolder = !_autoCreateTrimmedFolder;
-                });
-              },
-              behavior: HitTestBehavior.opaque,
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  SizedBox(
-                    height: 24,
-                    width: 24,
-                    child: Checkbox(
-                      value: _autoCreateTrimmedFolder,
-                      activeColor: const Color(0xFF76B900),
-                      onChanged: (val) {
-                        setState(() {
-                          _autoCreateTrimmedFolder = val ?? false;
-                        });
-                      },
-                    ),
+                  // Destination Info Card
+                  const Text(
+                    'Export Destination',
+                    style: TextStyle(fontSize: 11, color: Colors.white70),
                   ),
-                  const SizedBox(width: 8),
-                  const Expanded(
-                    child: Text(
-                      'Automatically add "Trimmed" folder',
-                      style: TextStyle(fontSize: 11, color: Colors.white70),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 8),
-
-          // Delete original clip after trim checkbox
-          MouseRegion(
-            cursor: SystemMouseCursors.click,
-            child: GestureDetector(
-              onTap: () {
-                setState(() {
-                  _deleteOriginalAfterTrim = !_deleteOriginalAfterTrim;
-                });
-              },
-              behavior: HitTestBehavior.opaque,
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  SizedBox(
-                    height: 24,
-                    width: 24,
-                    child: Checkbox(
-                      value: _deleteOriginalAfterTrim,
-                      activeColor: Colors.redAccent,
-                      onChanged: (val) {
-                        setState(() {
-                          _deleteOriginalAfterTrim = val ?? false;
-                        });
-                      },
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          'Delete original clip after trim',
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: _deleteOriginalAfterTrim ? Colors.redAccent : Colors.white70,
-                            fontWeight: _deleteOriginalAfterTrim ? FontWeight.bold : FontWeight.normal,
-                          ),
+                  const SizedBox(height: 6),
+                  InkWell(
+                    onTap: _changeExportDirectory,
+                    mouseCursor: SystemMouseCursors.click,
+                    borderRadius: BorderRadius.circular(6),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1E1E2E),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(
+                          color: _customExportDir != null ? const Color(0xFF76B900).withValues(alpha: 0.5) : Colors.transparent,
+                          width: 1,
                         ),
-                        if (_deleteOriginalAfterTrim)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 3),
-                            child: Row(
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.folder_open, size: 16, color: Color(0xFF76B900)),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              _getExportDirectoryPath(activeClip),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(fontSize: 10, color: Colors.grey.shade400, fontFamily: 'monospace'),
+                            ),
+                          ),
+                          if (activeClip != null || _customExportDir != null)
+                            HoverIconButton(
+                              icon: Icons.open_in_new,
+                              size: 14,
+                              defaultColor: Colors.grey,
+                              hoverColor: const Color(0xFF76B900),
+                              tooltip: 'Open in File Explorer',
+                              onPressed: () {
+                                final dir = _getExportDirectoryPath(activeClip);
+                                _openInExplorer(dir);
+                              },
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  if (_customExportDir != null) ...[
+                    const SizedBox(height: 4),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: InkWell(
+                        onTap: () => setState(() => _customExportDir = null),
+                        mouseCursor: SystemMouseCursors.click,
+                        child: const Text(
+                          'Reset to source folder',
+                          style: TextStyle(fontSize: 10, color: Colors.grey, decoration: TextDecoration.underline),
+                        ),
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 12),
+
+                  // Automatically add Trimmed folder checkbox
+                  MouseRegion(
+                    cursor: SystemMouseCursors.click,
+                    child: GestureDetector(
+                      onTap: () {
+                        setState(() {
+                          _autoCreateTrimmedFolder = !_autoCreateTrimmedFolder;
+                        });
+                      },
+                      behavior: HitTestBehavior.opaque,
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          SizedBox(
+                            height: 24,
+                            width: 24,
+                            child: Checkbox(
+                              value: _autoCreateTrimmedFolder,
+                              activeColor: const Color(0xFF76B900),
+                              onChanged: (val) {
+                                setState(() {
+                                  _autoCreateTrimmedFolder = val ?? false;
+                                });
+                              },
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          const Expanded(
+                            child: Text(
+                              'Automatically add "Trimmed" folder',
+                              style: TextStyle(fontSize: 11, color: Colors.white70),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+
+                  // Delete original clip after trim checkbox
+                  MouseRegion(
+                    cursor: SystemMouseCursors.click,
+                    child: GestureDetector(
+                      onTap: () {
+                        setState(() {
+                          _deleteOriginalAfterTrim = !_deleteOriginalAfterTrim;
+                        });
+                      },
+                      behavior: HitTestBehavior.opaque,
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          SizedBox(
+                            height: 24,
+                            width: 24,
+                            child: Checkbox(
+                              value: _deleteOriginalAfterTrim,
+                              activeColor: Colors.redAccent,
+                              onChanged: (val) {
+                                setState(() {
+                                  _deleteOriginalAfterTrim = val ?? false;
+                                });
+                              },
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
                               children: [
-                                const Icon(Icons.warning_amber_rounded, size: 11, color: Colors.redAccent),
-                                const SizedBox(width: 4),
-                                const Flexible(
-                                  child: Text(
-                                    "You can't revise the clip after ending the session!",
-                                    style: TextStyle(fontSize: 9, color: Colors.redAccent),
+                                Text(
+                                  'Delete original clip after trim',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: _deleteOriginalAfterTrim ? Colors.redAccent : Colors.white70,
+                                    fontWeight: _deleteOriginalAfterTrim ? FontWeight.bold : FontWeight.normal,
                                   ),
                                 ),
+                                if (_deleteOriginalAfterTrim)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 3),
+                                    child: Row(
+                                      children: [
+                                        const Icon(Icons.warning_amber_rounded, size: 11, color: Colors.redAccent),
+                                        const SizedBox(width: 4),
+                                        const Flexible(
+                                          child: Text(
+                                            "You can't revise the clip after ending the session!",
+                                            style: TextStyle(fontSize: 9, color: Colors.redAccent),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+
+                  // Metadata Information Card (Collapsible, Open by default)
+                  Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E1E2E),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.grey.shade900, width: 1),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        InkWell(
+                          onTap: () => setState(() => _isMetadataExpanded = !_isMetadataExpanded),
+                          mouseCursor: SystemMouseCursors.click,
+                          borderRadius: BorderRadius.circular(8),
+                          child: Padding(
+                            padding: const EdgeInsets.all(10),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.info_outline, color: Color(0xFF76B900), size: 15),
+                                const SizedBox(width: 6),
+                                const Expanded(
+                                  child: Text(
+                                    'METADATA INFORMATION',
+                                    style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF76B900)),
+                                  ),
+                                ),
+                                Icon(
+                                  _isMetadataExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+                                  size: 16,
+                                  color: const Color(0xFF76B900),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        if (_isMetadataExpanded)
+                          Padding(
+                            padding: const EdgeInsets.only(left: 10, right: 10, bottom: 10),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Divider(height: 1, color: Color(0xFF2E2E3E)),
+                                const SizedBox(height: 8),
+                                if (activeClip != null) ...[
+                                  _buildMetadataRow('File', activeClip.fileName),
+                                  if (activeClip.fileName != activeClip.originalFileName)
+                                    _buildMetadataRow('Original File', activeClip.originalFileName),
+                                  _buildMetadataRow('Format', path.extension(activeClip.filePath).toUpperCase().replaceAll('.', '')),
+                                  _buildMetadataRow('Duration', _formatDuration(activeClip.duration).split('.')[0]),
+                                  _buildMetadataRow('Size', activeClip.fileSizeFormatted),
+                                  _buildMetadataRow('Quality', activeClip.qualityString),
+                                  FutureBuilder<FileStat>(
+                                    future: File(activeClip.filePath).stat(),
+                                    builder: (context, snapshot) {
+                                      if (snapshot.hasData) {
+                                        final stat = snapshot.data!;
+                                        final modifiedStr = stat.modified.toString().split('.')[0];
+                                        return _buildMetadataRow('Modified', modifiedStr);
+                                      }
+                                      return const SizedBox.shrink();
+                                    },
+                                  ),
+                                ] else
+                                  const Text(
+                                    'No video selected',
+                                    style: TextStyle(fontSize: 10, color: Colors.grey),
+                                  ),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // Shortcuts Card (Collapsible, Collapsed by default)
+                  Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E1E2E),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.grey.shade900, width: 1),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        InkWell(
+                          onTap: () => setState(() => _isShortcutsExpanded = !_isShortcutsExpanded),
+                          mouseCursor: SystemMouseCursors.click,
+                          borderRadius: BorderRadius.circular(8),
+                          child: Padding(
+                            padding: const EdgeInsets.all(10),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.keyboard_outlined, color: Color(0xFF76B900), size: 16),
+                                const SizedBox(width: 8),
+                                const Expanded(
+                                  child: Text(
+                                    'SHORTCUTS',
+                                    style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF76B900)),
+                                  ),
+                                ),
+                                Icon(
+                                  _isShortcutsExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+                                  size: 16,
+                                  color: const Color(0xFF76B900),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        if (_isShortcutsExpanded)
+                          const Padding(
+                            padding: EdgeInsets.only(left: 10, right: 10, bottom: 10),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Divider(height: 1, color: Color(0xFF2E2E3E)),
+                                SizedBox(height: 8),
+                                _ShortcutRow(keys: 'K / Space', desc: 'Play / Pause'),
+                                _ShortcutRow(keys: 'Arrow Left / Right', desc: 'Seek 1s'),
+                                _ShortcutRow(keys: 'J / L', desc: 'Seek 5s'),
+                                _ShortcutRow(keys: 'Shift + J', desc: 'Jump to Start Cut'),
+                                _ShortcutRow(keys: 'Shift + L', desc: 'Jump to End Cut'),
+                                _ShortcutRow(keys: '[ / ]', desc: 'Set Start / End Cut'),
+                                _ShortcutRow(keys: 'Arrow Up / Down', desc: 'Prev / Next Video'),
+                                _ShortcutRow(keys: 'Shift + Up / Down', desc: 'Volume Up / Down'),
+                                _ShortcutRow(keys: 'M', desc: 'Mute / Unmute'),
+                                _ShortcutRow(keys: 'i / o / p', desc: 'Jump to 25% / 50% / 75%'),
+                                _ShortcutRow(keys: 'Shift + i / p', desc: 'Jump to Start / End'),
+                                _ShortcutRow(keys: 'Shift + < / >', desc: 'Playback Rate Down / Up'),
+                                _ShortcutRow(keys: 'Enter', desc: 'Execute Trim'),
+                                _ShortcutRow(keys: 'F2', desc: 'Rename Export File'),
+                                _ShortcutRow(keys: 'F12 / Ctrl+Shift+I', desc: 'Inspect Bounding Box'),
+                                _ShortcutRow(keys: 'Del', desc: 'Delete Selected Clip'),
                               ],
                             ),
                           ),
@@ -2958,163 +3497,61 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               ),
             ),
           ),
-          const SizedBox(height: 20),
 
-          // Video Metadata Card
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1E1E2E),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: Colors.grey.shade900, width: 1),
-            ),
+          const Divider(height: 1, color: Color(0xFF1E1E2E)),
+
+          // Bottom pinned action buttons area
+          Padding(
+            padding: const EdgeInsets.all(16.0),
             child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const Row(
-                  children: [
-                    Icon(Icons.info_outline, color: Color(0xFF76B900), size: 16),
-                    SizedBox(width: 6),
-                    Text(
-                      'VIDEO METADATA',
-                      style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF76B900)),
+                if (_isExporting)
+                  Column(
+                    children: [
+                      const LinearProgressIndicator(color: Color(0xFF76B900), backgroundColor: Color(0xFF1E1E2E)),
+                      const SizedBox(height: 8),
+                      Text(_exportStatus, style: const TextStyle(fontSize: 10, color: Colors.grey), textAlign: TextAlign.center),
+                    ],
+                  )
+                else
+                  ElevatedButton.icon(
+                    onPressed: activeClip != null ? _exportActiveClip : null,
+                    icon: const Icon(Icons.cut_outlined, size: 16),
+                    label: const Text('Trim!', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF76B900),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                      disabledBackgroundColor: Colors.grey.shade800,
                     ),
-                  ],
+                  ),
+                const SizedBox(height: 8),
+                // Delete Files button with 1080 deg spin animation on hover
+                SpinningDeleteButton(
+                  onPressed: activeClip != null ? () => _confirmDeleteFile(activeClip!) : null,
                 ),
                 const SizedBox(height: 10),
-                if (activeClip != null) ...[
-                  _buildMetadataRow('File', activeClip.fileName),
-                  if (activeClip.fileName != activeClip.originalFileName)
-                    _buildMetadataRow('Original File', activeClip.originalFileName),
-                  _buildMetadataRow('Format', path.extension(activeClip.filePath).toUpperCase().replaceAll('.', '')),
-                  _buildMetadataRow('Size', activeClip.fileSizeFormatted),
-                  _buildMetadataRow('Duration', _formatDuration(activeClip.duration).split('.')[0]),
-                  _buildMetadataRow('Quality', activeClip.qualityString),
-                  FutureBuilder<FileStat>(
-                    future: File(activeClip.filePath).stat(),
-                    builder: (context, snapshot) {
-                      if (snapshot.hasData) {
-                        final stat = snapshot.data!;
-                        final modifiedStr = stat.modified.toString().split('.')[0];
-                        return _buildMetadataRow('Modified', modifiedStr);
-                      }
-                      return const SizedBox.shrink();
-                    },
-                  ),
-                ] else
-                  const Text(
-                    'No video selected',
-                    style: TextStyle(fontSize: 10, color: Colors.grey),
-                  ),
-              ],
-            ),
-          ),
-          const Spacer(),
-          Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1E1E2E),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: Colors.grey.shade900, width: 1),
-            ),
-            child: const Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Text(
-                      '[]',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF76B900),
-                        fontFamily: 'monospace',
+                Center(
+                  child: InkWell(
+                    onTap: _showAboutDialog,
+                    mouseCursor: SystemMouseCursors.click,
+                    borderRadius: BorderRadius.circular(4),
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                      child: Text(
+                        'Created by ZFanz',
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: Colors.grey,
+                          decoration: TextDecoration.underline,
+                        ),
                       ),
                     ),
-                    SizedBox(width: 8),
-                    Text(
-                      'SHORTCUTS',
-                      style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF76B900)),
-                    ),
-                  ],
-                ),
-                SizedBox(height: 8),
-                _ShortcutRow(keys: 'K / Space', desc: 'Play / Pause'),
-                _ShortcutRow(keys: 'Arrow Left / Right', desc: 'Seek 1s'),
-                _ShortcutRow(keys: 'J / L', desc: 'Seek 5s'),
-                _ShortcutRow(keys: 'Shift + J', desc: 'Jump to Start Cut'),
-                _ShortcutRow(keys: 'Shift + L', desc: 'Jump to End Cut'),
-                _ShortcutRow(keys: '[ / ]', desc: 'Set Start / End Cut'),
-                _ShortcutRow(keys: 'Arrow Up / Down', desc: 'Prev / Next Video'),
-                _ShortcutRow(keys: 'Shift + Up / Down', desc: 'Volume Up / Down'),
-                _ShortcutRow(keys: 'M', desc: 'Mute / Unmute'),
-                _ShortcutRow(keys: 'i / o / p', desc: 'Jump to 25% / 50% / 75%'),
-                _ShortcutRow(keys: 'Shift + i / p', desc: 'Jump to Start / End'),
-                _ShortcutRow(keys: 'Shift + < / >', desc: 'Playback Rate Down / Up'),
-                _ShortcutRow(keys: 'Enter', desc: 'Execute Trim'),
-                _ShortcutRow(keys: 'F2', desc: 'Rename Export File'),
-                _ShortcutRow(keys: 'Del', desc: 'Delete Selected Clip'),
-              ],
-            ),
-          ),
-          const SizedBox(height: 12),
-
-          // Export Button
-          if (_isExporting)
-            Column(
-              children: [
-                const LinearProgressIndicator(color: Color(0xFF76B900), backgroundColor: Color(0xFF1E1E2E)),
-                const SizedBox(height: 8),
-                Text(_exportStatus, style: const TextStyle(fontSize: 10, color: Colors.grey), textAlign: TextAlign.center),
-              ],
-            )
-          else
-            ElevatedButton.icon(
-              onPressed: activeClip != null ? _exportActiveClip : null,
-              icon: const Icon(Icons.cut_outlined, size: 16),
-              label: const Text('Trim!', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF76B900),
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 14),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-                disabledBackgroundColor: Colors.grey.shade800,
-              ),
-            ),
-          const SizedBox(height: 8),
-          // Delete Files button
-          ElevatedButton.icon(
-            onPressed: activeClip != null ? () => _confirmDeleteFile(activeClip!) : null,
-            icon: const Icon(Icons.delete_forever_outlined, size: 16),
-            label: const Text('Delete Clip', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF2A1520),
-              foregroundColor: Colors.redAccent,
-              padding: const EdgeInsets.symmetric(vertical: 11),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(6),
-                side: BorderSide(color: Colors.redAccent.withOpacity(0.5)),
-              ),
-              disabledBackgroundColor: Colors.grey.shade900,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Center(
-            child: InkWell(
-              onTap: _showAboutDialog,
-              mouseCursor: SystemMouseCursors.click,
-              borderRadius: BorderRadius.circular(4),
-              child: const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                child: Text(
-                  'Created by ZFanz',
-                  style: TextStyle(
-                    fontSize: 10,
-                    color: Colors.grey,
-                    decoration: TextDecoration.underline,
                   ),
                 ),
-              ),
+              ],
             ),
           ),
         ],
@@ -3131,12 +3568,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           Text(label, style: const TextStyle(fontSize: 10, color: Colors.grey)),
           const SizedBox(width: 8),
           Expanded(
-            child: Text(
-              value,
-              textAlign: TextAlign.end,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 10, color: Colors.white70, fontFamily: 'monospace'),
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: MarqueeText(
+                text: value,
+                style: const TextStyle(fontSize: 10, color: Colors.white70, fontFamily: 'monospace'),
+              ),
             ),
           ),
         ],
@@ -3252,13 +3689,23 @@ class _MarqueeTextState extends State<MarqueeText> {
 
   @override
   Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      controller: _scrollController,
-      scrollDirection: Axis.horizontal,
-      physics: const NeverScrollableScrollPhysics(),
-      child: Text(
-        widget.text,
-        style: widget.style,
+    return ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(
+        dragDevices: {
+          PointerDeviceKind.touch,
+          PointerDeviceKind.mouse,
+          PointerDeviceKind.trackpad,
+          PointerDeviceKind.stylus,
+        },
+      ),
+      child: SingleChildScrollView(
+        controller: _scrollController,
+        scrollDirection: Axis.horizontal,
+        physics: const BouncingScrollPhysics(),
+        child: Text(
+          widget.text,
+          style: widget.style,
+        ),
       ),
     );
   }
@@ -3392,16 +3839,37 @@ class AlignedRangeSliderTrackShape extends RoundedRectRangeSliderTrackShape {
 
 /// Displays a lightweight JPEG thumbnail extracted via FFmpeg image cache.
 /// Zero native Player instances — prevents 0x8001010e COM thread crash and folder switching lag.
-class VideoThumbnailWidget extends StatelessWidget {
+class VideoThumbnailWidget extends StatefulWidget {
   final String filePath;
   const VideoThumbnailWidget({super.key, required this.filePath});
+
+  @override
+  State<VideoThumbnailWidget> createState() => _VideoThumbnailWidgetState();
+}
+
+class _VideoThumbnailWidgetState extends State<VideoThumbnailWidget> {
+  late Future<File?> _thumbnailFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _thumbnailFuture = VideoTrimmer.generateThumbnail(widget.filePath);
+  }
+
+  @override
+  void didUpdateWidget(VideoThumbnailWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.filePath != widget.filePath) {
+      _thumbnailFuture = VideoTrimmer.generateThumbnail(widget.filePath);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return ClipRRect(
       borderRadius: BorderRadius.circular(4),
       child: FutureBuilder<File?>(
-        future: VideoTrimmer.generateThumbnail(filePath),
+        future: _thumbnailFuture,
         builder: (context, snapshot) {
           if (snapshot.hasData && snapshot.data != null) {
             return Image.file(
@@ -3418,6 +3886,180 @@ class VideoThumbnailWidget extends StatelessWidget {
             ),
           );
         },
+      ),
+    );
+  }
+}
+
+class HoverIconButton extends StatefulWidget {
+  final IconData icon;
+  final double size;
+  final Color defaultColor;
+  final Color hoverColor;
+  final Color? hoverBgColor;
+  final String? tooltip;
+  final VoidCallback? onPressed;
+  final bool enableSpin;
+
+  const HoverIconButton({
+    super.key,
+    required this.icon,
+    this.size = 14,
+    this.defaultColor = Colors.grey,
+    this.hoverColor = const Color(0xFF76B900),
+    this.hoverBgColor,
+    this.tooltip,
+    this.onPressed,
+    this.enableSpin = false,
+  });
+
+  @override
+  State<HoverIconButton> createState() => _HoverIconButtonState();
+}
+
+class _HoverIconButtonState extends State<HoverIconButton> with SingleTickerProviderStateMixin {
+  bool _isHovered = false;
+  late final AnimationController _spinController;
+
+  @override
+  void initState() {
+    super.initState();
+    _spinController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 700),
+    );
+  }
+
+  @override
+  void dispose() {
+    _spinController.dispose();
+    super.dispose();
+  }
+
+  void _onHover(bool isHovered) {
+    setState(() {
+      _isHovered = isHovered;
+    });
+    if (widget.enableSpin && isHovered) {
+      _spinController.forward(from: 0.0);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final effectiveHoverBg = widget.hoverBgColor ?? widget.hoverColor.withValues(alpha: 0.2);
+
+    Widget iconWidget = Icon(
+      widget.icon,
+      size: widget.size,
+      color: _isHovered ? widget.hoverColor : widget.defaultColor,
+    );
+
+    if (widget.enableSpin) {
+      iconWidget = RotationTransition(
+        turns: Tween<double>(begin: 0.0, end: 0.5).animate(
+          CurvedAnimation(parent: _spinController, curve: Curves.easeOutCubic),
+        ),
+        child: iconWidget,
+      );
+    }
+
+    Widget result = MouseRegion(
+      cursor: widget.onPressed != null ? SystemMouseCursors.click : SystemMouseCursors.basic,
+      onEnter: (_) => _onHover(true),
+      onExit: (_) => _onHover(false),
+      child: GestureDetector(
+        onTap: widget.onPressed,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          padding: const EdgeInsets.all(5),
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: _isHovered ? effectiveHoverBg : Colors.transparent,
+          ),
+          child: iconWidget,
+        ),
+      ),
+    );
+
+    if (widget.tooltip != null) {
+      return Tooltip(message: widget.tooltip!, child: result);
+    }
+    return result;
+  }
+}
+
+class SpinningDeleteButton extends StatefulWidget {
+  final VoidCallback? onPressed;
+  const SpinningDeleteButton({super.key, this.onPressed});
+
+  @override
+  State<SpinningDeleteButton> createState() => _SpinningDeleteButtonState();
+}
+
+class _SpinningDeleteButtonState extends State<SpinningDeleteButton> with SingleTickerProviderStateMixin {
+  bool _isHovered = false;
+  late final AnimationController _spinController;
+
+  @override
+  void initState() {
+    super.initState();
+    _spinController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 700),
+    );
+  }
+
+  @override
+  void dispose() {
+    _spinController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: widget.onPressed != null ? SystemMouseCursors.click : SystemMouseCursors.basic,
+      onEnter: (_) {
+        setState(() => _isHovered = true);
+        if (widget.onPressed != null) {
+          _spinController.forward(from: 0.0);
+        }
+      },
+      onExit: (_) => setState(() => _isHovered = false),
+      child: ElevatedButton.icon(
+        onPressed: widget.onPressed,
+        icon: RotationTransition(
+          turns: Tween<double>(begin: 0.0, end: 3.0).animate(
+            CurvedAnimation(parent: _spinController, curve: Curves.easeOutCubic),
+          ),
+          child: Icon(
+            Icons.delete_forever_outlined,
+            size: 16,
+            color: _isHovered ? Colors.redAccent : Colors.redAccent.withValues(alpha: 0.8),
+          ),
+        ),
+        label: Text(
+          'Delete Clip',
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: _isHovered ? Colors.white : Colors.redAccent,
+          ),
+        ),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: _isHovered ? const Color(0xFF3D1622) : const Color(0xFF2A1520),
+          elevation: _isHovered ? 2 : 0,
+          padding: const EdgeInsets.symmetric(vertical: 11),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(6),
+            side: BorderSide(
+              color: _isHovered ? Colors.redAccent : Colors.redAccent.withValues(alpha: 0.5),
+              width: _isHovered ? 1.5 : 1.0,
+            ),
+          ),
+          disabledBackgroundColor: Colors.grey.shade900,
+        ),
       ),
     );
   }

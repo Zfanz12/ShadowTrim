@@ -2,11 +2,39 @@
 
 All notable changes to ShadowTrim will be documented in this file.
 
-## Upcoming Fixes & Features
-
-_No items currently planned — all previously listed items have shipped in [2.1.1]._
-
 # Releases
+
+## [2.1.2] - 2026-08-01
+
+### New Features & Core Logic
+
+**Major:**
+* **System Logging Implementation** — Added a comprehensive internal logging system. The application now generates and stores local `.log` files to track events, background processes, file operations, and crash reports, making future troubleshooting and debugging significantly easier. You can check it on 'C:\Users\(yourUsername)\Documents\ShadowTrim\logs'!.
+
+### Bug Fixes & Performance Enhancements
+
+**Major:**
+* **Hardware Codec Configuration** — Updated the underlying video player configurations for improved and supported more codec and stability also performance
+* **Fix App Crash on Fresh Folder Load** — Fixed a critical bug where opening a new folder upon a fresh start would cause the application to immediately stop responding and crash.
+* **Optimize 'Open Folder' Execution** — Significantly improved the response time when clicking any "Open Folder" buttons.
+* **Fix File's Duration Display** — Fixed a bug where the duration of videos in the file list would remain stuck on "loading" and only reveal the actual time after the user manually selected the clip.
+
+**Minor:**
+* **Fix Metadata Text Overflow** — Fixed an issue where long text in the "Quality" metadata field overflowed, fixing it by adding a horizontal scrolling effect.
+
+### Quality of Life (QoL) & UI/UX Improvements
+
+**Major:**
+* **Loading Overlay** — Added a visual loading overlay in the video player area when first opening or changing folders. This indicator ensures users know the video is buffering and prevents premature playback actions.
+* **Collapsible Side Panels** — The "Metadata Information" and "Shortcuts" panels are now collapsible to save screen space. By default, the Metadata panel remains open, while the Shortcuts panel is collapsed.
+
+**Minor:**
+* **Added 0.25x Playback Speed** — Further expanded the playback speed controls by adding a `0.25x`.
+* **Shortcut Panel Icon Update** — Changed the icon for the "Shortcuts" panel to a keyboard icon to better represent its function.
+* **Comprehensive Hover Effects** — Added missing hover state animations across various UI elements to provide consistent visual feedback.
+* **Metadata Layout Adjustment** — Swapped the visual positions of the "Size" and "Duration" fields within the metadata information panel.
+
+---
 
 ## [2.1.1] - 2026-07-28
 

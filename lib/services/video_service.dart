@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:convert';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as path;
+import 'logger_service.dart';
 
 class _ThumbRequest {
   final String videoPath;
@@ -12,6 +13,7 @@ class _ThumbRequest {
 
 class VideoTrimmer {
   static final List<_ThumbRequest> _thumbQueue = [];
+  static final Map<String, Future<File?>> _thumbFutures = {};
   static int _activeThumbJobs = 0;
   static const int _maxConcurrentThumbJobs = 2;
 
@@ -23,11 +25,21 @@ class VideoTrimmer {
       }
     }
     _thumbQueue.clear();
+    _thumbFutures.clear();
   }
 
   /// Generates a fast JPEG thumbnail image using FFmpeg in system temp folder.
   /// Uses a concurrency-limited queue (max 2 jobs) to prevent CPU/disk saturation and crashes on large folders.
-  static Future<File?> generateThumbnail(String videoPath) async {
+  static Future<File?> generateThumbnail(String videoPath) {
+    if (_thumbFutures.containsKey(videoPath)) {
+      return _thumbFutures[videoPath]!;
+    }
+    final future = _generateThumbnailInternal(videoPath);
+    _thumbFutures[videoPath] = future;
+    return future;
+  }
+
+  static Future<File?> _generateThumbnailInternal(String videoPath) async {
     try {
       final file = File(videoPath);
       if (!await file.exists()) return null;
@@ -45,8 +57,8 @@ class VideoTrimmer {
       _thumbQueue.add(_ThumbRequest(videoPath, completer));
       _processThumbQueue();
       return completer.future;
-    } catch (e) {
-      print('Thumbnail generation error: $e');
+    } catch (e, stack) {
+      LoggerService.logError('Thumbnail generation error for $videoPath: $e', stack);
     }
     return null;
   }
@@ -85,7 +97,7 @@ class VideoTrimmer {
         }
       } catch (_) {}
 
-      final result = await Process.run(ffmpegCmd, [
+      var result = await Process.run(ffmpegCmd, [
         '-ss', '00:00:01',
         '-i', videoPath,
         '-vframes', '1',
@@ -95,11 +107,25 @@ class VideoTrimmer {
         thumbPath,
       ]);
 
+      if (result.exitCode != 0 || !await thumbFile.exists()) {
+        // Fallback for AV1 / high-bitrate video streams: extract first available frame (00:00:00)
+        result = await Process.run(ffmpegCmd, [
+          '-i', videoPath,
+          '-vframes', '1',
+          '-q:v', '5',
+          '-s', '160x90',
+          '-y',
+          thumbPath,
+        ]);
+      }
+
       if (result.exitCode == 0 && await thumbFile.exists()) {
         return thumbFile;
+      } else {
+        LoggerService.logError('FFmpeg thumbnail failed exitCode ${result.exitCode}: ${result.stderr}');
       }
-    } catch (e) {
-      print('FFmpeg thumbnail execution error: $e');
+    } catch (e, stack) {
+      LoggerService.logError('FFmpeg thumbnail execution error for $videoPath: $e', stack);
     }
     return null;
   }
@@ -134,6 +160,10 @@ class VideoTrimmer {
         String? resStr;
         int? fpsInt;
         String? bitrateStr;
+        double? durationSec;
+        if (format['duration'] != null) {
+          durationSec = double.tryParse(format['duration'].toString());
+        }
 
         for (final stream in streams) {
           if (stream['codec_type'] == 'video') {
@@ -141,6 +171,10 @@ class VideoTrimmer {
             final height = stream['height'];
             if (width != null && height != null) {
               resStr = '${width}x$height';
+            }
+
+            if (durationSec == null && stream['duration'] != null) {
+              durationSec = double.tryParse(stream['duration'].toString());
             }
 
             final rFrameRate = stream['r_frame_rate'] as String? ?? stream['avg_frame_rate'] as String?;
@@ -172,10 +206,20 @@ class VideoTrimmer {
           }
         }
 
-        return {'resolution': resStr, 'fps': fpsInt, 'bitrate': bitrateStr};
+        Duration? durationObj;
+        if (durationSec != null && durationSec > 0) {
+          durationObj = Duration(milliseconds: (durationSec * 1000).round());
+        }
+
+        return {
+          'resolution': resStr,
+          'fps': fpsInt,
+          'bitrate': bitrateStr,
+          'duration': durationObj,
+        };
       }
-    } catch (e) {
-      print('FFprobe error: $e');
+    } catch (e, stack) {
+      LoggerService.logError('FFprobe metadata probe error for $filePath: $e', stack);
     }
     return {};
   }
@@ -218,6 +262,8 @@ class VideoTrimmer {
         // Fallback to system ffmpeg if Platform.resolvedExecutable fails (e.g. in test env)
       }
 
+      LoggerService.logInfo('Trimming video [lossless]: $inputPath -> $outputPath (start: $startTime, end: $endTime)');
+
       // FFmpeg command with -y flag to force overwrite (prevents mass export corruption)
       final result = await Process.run(ffmpegCmd, [
         '-y', // Force overwrite output file — prevents hang on batch exports
@@ -228,6 +274,13 @@ class VideoTrimmer {
         '-map', '0', // Keep all streams (video, audio, subtitles, etc)
         outputPath
       ]);
+
+      if (result.exitCode == 0 && await outputFile.exists()) {
+        LoggerService.logInfo('Video trim success: $outputPath');
+        return outputPath;
+      } else {
+        LoggerService.logError('FFmpeg trim failed exitCode ${result.exitCode}: ${result.stderr}');
+      }
 
       if (result.exitCode != 0) {
         print('FFmpeg Error: ${result.stderr}');
