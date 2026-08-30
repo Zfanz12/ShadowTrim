@@ -14,7 +14,6 @@ class VideoClip {
   String? bitrate;
   bool isTrimmed;
   bool isAnimating;
-  bool isOriginalDeleted;
   final DateTime dateModified;
   final DateTime dateCreated;
   String? trimmedOutputPath;
@@ -34,7 +33,6 @@ class VideoClip {
     this.bitrate,
     this.isTrimmed = false,
     this.isAnimating = false,
-    this.isOriginalDeleted = false,
     this.trimmedOutputPath,
   });
 

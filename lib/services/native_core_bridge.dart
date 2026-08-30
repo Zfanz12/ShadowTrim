@@ -1,5 +1,6 @@
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:ffi/ffi.dart';
 import 'package:path/path.dart' as path;
 import 'logger_service.dart';
@@ -197,7 +198,7 @@ class ShadowTrimNativeBridge {
 
     // Run blocking FFI call in a separate isolate to keep the UI thread responsive
     try {
-      final result = await _runBlockingProcess(executablePath, argsString, bufferSize);
+      final result = await Isolate.run(() => _runBlockingProcess(executablePath, argsString, bufferSize));
       return result;
     } catch (e, stack) {
       LoggerService.logError('FFI executeProcess error: $e', stack);

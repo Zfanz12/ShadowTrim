@@ -25,8 +25,6 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingObserver, TickerProviderStateMixin {
-  // Tabs
-  bool _isFolderMode = false;
   bool _deleteOriginalAfterTrim = false;
   bool _viewingTrimmedMode = false;
   final Set<String> _blacklistedClipNames = {};
@@ -56,7 +54,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
   // Export Settings
   final TextEditingController _exportNameController = TextEditingController();
-  bool _preserveMetadata = true;
   bool _isExporting = false;
   String _exportStatus = '';
   String? _customExportDir;
@@ -1228,12 +1225,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     }
   }
 
-  Future<void> _deleteQueuedOriginalFiles() async {
-    for (final filePath in _originalClipsToDelete) {
-      await _deleteToRecycleBin(filePath);
-    }
-    _originalClipsToDelete.clear();
-  }
 
   // ── Full Session Persistence ──────────────────────────────────────────────
 
