@@ -1117,7 +1117,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     ),
                     const SizedBox(height: 8),
                     const Text(
-                      'Version : v2.1.2',
+                      'Version : v2.2.0',
                       style: TextStyle(color: Colors.grey, fontSize: 12, fontWeight: FontWeight.w500),
                     ),
                     const SizedBox(height: 24),

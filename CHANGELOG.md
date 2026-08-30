@@ -4,16 +4,21 @@ All notable changes to ShadowTrim will be documented in this file.
 
 # Releases
 
-## [2.2.0] - 2026-08-29
+## [2.2.0] - 2026-08-30
 
-### New Features & Core Architecture
+### New Features & Core Engine
 
 **Major:**
-* **C++ Native Core Engine (`shadowtrim_core.dll`)** — Migrated core system and file operations to native C++ compiled directly alongside the Windows binary.
-* **Dart FFI Interop Bridge (`dart:ffi`)** — Implemented zero-overhead direct memory & function calls between Flutter UI and the C++ Core engine.
-* **Instant Win32 File Timestamp Preservation** — Replaced slow PowerShell subprocess invocations (500–1000 ms) with native Win32 `GetFileTime` and `SetFileTime` kernel APIs (< 0.01 ms), accelerating batch export completion by up to 10,000x for metadata operations.
-* **Direct High-Priority Process Pipeline** — Direct Win32 `CreateProcessW` execution without shell overhead for trimming and video probing.
-* **Resilient Dual-Engine Fallback** — Added graceful automatic fallback to standard Dart engine for test and non-Windows environments.
+* **Migration to C++ Native Core** — Rebuilt core file operations, processes, and timestamp handling in native C++ for faster video trimming and instant date preservation.
+
+### Bug Fixes & Improvements
+
+**Major:**
+* **Single Session File** — Merged session data and checklist history into a single `.shadowtrim_session.json` file instead of two separate JSON files.
+* **Fix Cross-Drive Export** — Fixed an OS error when exporting or saving trimmed clips to a different disk drive (e.g. from Drive C: to Drive D:).
+* **Recycle Bin Deletion on End Session** — Files queued for deletion are now sent to the Windows Recycle Bin with a real-time progress bar.
+* **Auto-Select First Untrimmed Clip** — Loading a session or opening a folder now automatically selects the first untrimmed video instead of selecting trimmed ones.
+* **Toast Notification Animations** — Added smooth slide-up and fade-out animations when notifications appear and disappear, plus a tap-to-dismiss option.
 
 ---
 
