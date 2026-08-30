@@ -25,9 +25,11 @@ It's perfect for quickly trimming multiple clips (gameplay highlights, OBS recor
 
 | Component | Technology |
 |---|---|
-| Framework | [Flutter](https://flutter.dev) (Dart) — Desktop (Windows / macOS / Linux) |
-| Video Playback | [`media_kit`](https://pub.dev/packages/media_kit) & [`media_kit_video`](https://pub.dev/packages/media_kit_video) |
-| Video Trimming | [FFmpeg](https://ffmpeg.org/) (invoked via `Process.run`, external system dependency) |
+| UI & Client Application | [Flutter](https://flutter.dev) (Dart) — High-Performance Desktop UI |
+| Core Native Engine | **C++ (Win32 Native Engine / `shadowtrim_core.dll`)** |
+| FFI Interop Bridge | [`dart:ffi`](https://dart.dev/guides/libraries/c-interop) & [`package:ffi`](https://pub.dev/packages/ffi) |
+| Video Playback | [`media_kit`](https://pub.dev/packages/media_kit) & [`media_kit_video`](https://pub.dev/packages/media_kit_video) (`libmpv`) |
+| Video Trimming | [FFmpeg](https://ffmpeg.org/) (Stream copy invoked via C++ Native Engine & Fallback) |
 | Drag & Drop | [`desktop_drop`](https://pub.dev/packages/desktop_drop) |
 | File Picker | [`file_picker`](https://pub.dev/packages/file_picker) |
 | Path Utilities | [`path`](https://pub.dev/packages/path) |

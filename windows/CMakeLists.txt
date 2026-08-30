@@ -49,6 +49,14 @@ endfunction()
 set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
 add_subdirectory(${FLUTTER_MANAGED_DIR})
 
+# Native C++ Core Engine (shadowtrim_core)
+add_library(shadowtrim_core SHARED
+  "native_core/shadowtrim_core.cpp"
+  "native_core/shadowtrim_core.h"
+)
+apply_standard_settings(shadowtrim_core)
+target_compile_definitions(shadowtrim_core PRIVATE "SHADOWTRIM_EXPORTS")
+
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
 
@@ -73,6 +81,10 @@ set(INSTALL_BUNDLE_DATA_DIR "${CMAKE_INSTALL_PREFIX}/data")
 set(INSTALL_BUNDLE_LIB_DIR "${CMAKE_INSTALL_PREFIX}")
 
 install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+  COMPONENT Runtime)
+
+install(TARGETS shadowtrim_core RUNTIME DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+  ARCHIVE DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
 install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"

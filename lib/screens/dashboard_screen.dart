@@ -16,6 +16,7 @@ import 'package:flutter_window_close/flutter_window_close.dart';
 import '../models/clip_model.dart';
 import '../services/video_service.dart';
 import '../services/logger_service.dart';
+import '../services/native_core_bridge.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -38,6 +39,9 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   bool _isExiting = false;
   bool _isEndingSession = false;
   String _endingSessionStatus = '';
+  int _totalDeletingFiles = 0;
+  int _currentDeletedCount = 0;
+  String _currentDeletingFileName = '';
   bool _isImporting = false;
 
   // State
@@ -626,13 +630,18 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   }
 
   void _showSnackBar(String message, {bool isError = false, bool isDelete = false}) {
-    ScaffoldMessenger.of(context).showSnackBar(
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.clearSnackBars();
+    messenger.showSnackBar(
       SnackBar(
         content: Text(
           message,
           style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
         ),
         backgroundColor: (isError || isDelete) ? Colors.red.shade800 : Colors.green.shade800,
+        duration: const Duration(seconds: 3),
+        behavior: SnackBarBehavior.floating,
       ),
     );
   }
@@ -685,20 +694,37 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
   Future<void> _deleteToRecycleBin(String filePath) async {
     try {
-      final escapedPath = filePath.replaceAll('"', '`"');
-      final cmd = 'Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile("$escapedPath", "OnlyErrorDialogs", "SendToRecycleBin")';
-      final res = await Process.run('powershell', ['-NoProfile', '-NonInteractive', '-Command', cmd]);
-      if (res.exitCode != 0) {
+      final file = File(filePath);
+      if (!await file.exists()) return;
+
+      // 1. High-Performance C++ Win32 Recycle Bin (<1ms)
+      if (Platform.isWindows && ShadowTrimNativeBridge.isAvailable) {
+        final success = ShadowTrimNativeBridge.recycleFileNative(filePath);
+        if (success) {
+          LoggerService.logInfo('Recycled file via C++ Native Core: $filePath');
+          return;
+        }
+      }
+
+      // 2. PowerShell Fallback
+      if (Platform.isWindows) {
+        final escapedPath = filePath.replaceAll('"', '`"');
+        final cmd = 'Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile("$escapedPath", "OnlyErrorDialogs", "SendToRecycleBin")';
+        final res = await Process.run('powershell', ['-NoProfile', '-NonInteractive', '-Command', cmd]);
+        if (res.exitCode == 0) return;
+      }
+
+      // 3. Direct File Delete Fallback
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (e) {
+      try {
         final file = File(filePath);
         if (await file.exists()) {
           await file.delete();
         }
-      }
-    } catch (e) {
-      final file = File(filePath);
-      if (await file.exists()) {
-        await file.delete();
-      }
+      } catch (_) {}
     }
   }
 
@@ -1363,47 +1389,59 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
 
     if (confirmed == true) {
+      final totalCount = _deletedClips.length + _originalClipsToDelete.length;
       setState(() {
         _isEndingSession = true;
-        _endingSessionStatus = 'Deleting session files & moving to Recycle Bin... Please do not close the program.';
+        _totalDeletingFiles = totalCount;
+        _currentDeletedCount = 0;
+        _currentDeletingFileName = '';
+        _endingSessionStatus = totalCount > 0
+            ? 'Deleting session files... (0/$totalCount) deleted'
+            : 'Cleaning up session files...';
       });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Row(
-            children: [
-              SizedBox(
-                width: 14,
-                height: 14,
-                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-              ),
-              SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  'Deleting session files... Please do not close the program!',
-                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
-                ),
-              ),
-            ],
-          ),
-          backgroundColor: Colors.red.shade900,
-          duration: const Duration(seconds: 8),
-        ),
-      );
 
       try {
         // Delete clips flagged via "Delete Clip" button
-        for (final clip in _deletedClips) {
+        for (final clip in List<VideoClip>.from(_deletedClips)) {
+          if (!mounted) break;
+          setState(() {
+            _currentDeletingFileName = clip.fileName;
+          });
           await _deleteToRecycleBin(clip.filePath);
+          if (!mounted) break;
+          setState(() {
+            _currentDeletedCount++;
+            _endingSessionStatus = 'Deleting session files... ($_currentDeletedCount/$_totalDeletingFiles) deleted';
+          });
         }
+
         // Delete clips flagged via "Delete original clip after trim"
-        await _deleteQueuedOriginalFiles();
+        for (final filePath in List<String>.from(_originalClipsToDelete)) {
+          if (!mounted) break;
+          setState(() {
+            _currentDeletingFileName = path.basename(filePath);
+          });
+          await _deleteToRecycleBin(filePath);
+          if (!mounted) break;
+          setState(() {
+            _currentDeletedCount++;
+            _endingSessionStatus = 'Deleting session files... ($_currentDeletedCount/$_totalDeletingFiles) deleted';
+          });
+        }
+        _originalClipsToDelete.clear();
+
         await _deleteSessionBlacklist();
         await _deleteSessionData();
-        // Give progress bar visual time to animate
-        await Future.delayed(const Duration(milliseconds: 2000));
+
+        if (mounted) {
+          setState(() {
+            _endingSessionStatus = 'Session cleanup complete! ($_totalDeletingFiles/$_totalDeletingFiles)';
+          });
+        }
+        await Future.delayed(const Duration(milliseconds: 300));
       } finally {
         if (mounted) {
+          final deletedTotal = _totalDeletingFiles;
           setState(() {
             _clips.clear();
             _deletedClips.clear();
@@ -1411,10 +1449,14 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             _blacklistedClipNames.clear();
             _originalClipsToDelete.clear();
             _isEndingSession = false;
+            _totalDeletingFiles = 0;
+            _currentDeletedCount = 0;
+            _currentDeletingFileName = '';
           });
           _player.pause();
-          ScaffoldMessenger.of(context).hideCurrentSnackBar();
-          _showSnackBar('Session ended cleanly.');
+          _showSnackBar(deletedTotal > 0
+              ? 'Session ended cleanly ($deletedTotal files deleted).'
+              : 'Session ended cleanly.');
         }
       }
     }
@@ -1439,26 +1481,46 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           await _saveSessionBlacklist();
           return AppExitResponse.exit;
         } else if (result == 'delete') {
+          final totalCount = _deletedClips.length + _originalClipsToDelete.length;
           setState(() {
             _isExiting = true;
             _isEndingSession = true;
-            _endingSessionStatus = 'Deleting session files... Please do not close the program!';
+            _totalDeletingFiles = totalCount;
+            _currentDeletedCount = 0;
+            _currentDeletingFileName = '';
+            _endingSessionStatus = totalCount > 0
+                ? 'Deleting session files... (0/$totalCount) deleted'
+                : 'Cleaning up session files...';
           });
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Text(
-                'Deleting session files... Please do not close the program!',
-                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
-              ),
-              backgroundColor: Colors.red.shade900,
-              duration: const Duration(seconds: 8),
-            ),
-          );
-          // End This Session — execute all pending deletions
-          for (final clip in _deletedClips) {
+
+          // End This Session — execute all pending deletions with progress
+          for (final clip in List<VideoClip>.from(_deletedClips)) {
+            if (!mounted) break;
+            setState(() {
+              _currentDeletingFileName = clip.fileName;
+            });
             await _deleteToRecycleBin(clip.filePath);
+            if (!mounted) break;
+            setState(() {
+              _currentDeletedCount++;
+              _endingSessionStatus = 'Deleting session files... ($_currentDeletedCount/$_totalDeletingFiles) deleted';
+            });
           }
-          await _deleteQueuedOriginalFiles();
+
+          for (final filePath in List<String>.from(_originalClipsToDelete)) {
+            if (!mounted) break;
+            setState(() {
+              _currentDeletingFileName = path.basename(filePath);
+            });
+            await _deleteToRecycleBin(filePath);
+            if (!mounted) break;
+            setState(() {
+              _currentDeletedCount++;
+              _endingSessionStatus = 'Deleting session files... ($_currentDeletedCount/$_totalDeletingFiles) deleted';
+            });
+          }
+          _originalClipsToDelete.clear();
+
           await _deleteSessionBlacklist();
           await _deleteSessionData();
           return AppExitResponse.exit;
@@ -1818,34 +1880,97 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             // Bottom Deletion Progress Bar
             if (_isEndingSession)
               Container(
-                color: const Color(0xFF161622),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF130E14),
+                  border: Border(
+                    top: BorderSide(
+                      color: Colors.redAccent.withOpacity(0.35),
+                      width: 1,
+                    ),
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.5),
+                      blurRadius: 8,
+                      offset: const Offset(0, -2),
+                    ),
+                  ],
+                ),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const LinearProgressIndicator(
+                    LinearProgressIndicator(
                       minHeight: 4,
-                      color: Colors.white,
-                      backgroundColor: Color(0xFF1E1E2E),
+                      value: _totalDeletingFiles > 0
+                          ? (_currentDeletedCount / _totalDeletingFiles).clamp(0.0, 1.0)
+                          : null,
+                      valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF76B900)),
+                      backgroundColor: const Color(0xFF1E1E2E),
                     ),
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                      color: const Color(0xFF1F0C0C),
                       child: Row(
                         children: [
-                          const Icon(Icons.delete_sweep_outlined, size: 16, color: Colors.white),
-                          const SizedBox(width: 8),
+                          Container(
+                            padding: const EdgeInsets.all(6),
+                            decoration: BoxDecoration(
+                              color: Colors.redAccent.withOpacity(0.15),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: const Icon(Icons.delete_sweep_outlined, size: 16, color: Colors.redAccent),
+                          ),
+                          const SizedBox(width: 10),
                           Expanded(
-                            child: Text(
-                              _endingSessionStatus.isNotEmpty
-                                  ? _endingSessionStatus
-                                  : 'Deleting session files... Please do not close the program!',
-                              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Row(
+                                  children: [
+                                    Text(
+                                      _totalDeletingFiles > 0
+                                          ? 'Deleting session files: ($_currentDeletedCount/$_totalDeletingFiles) deleted'
+                                          : 'Cleaning up session files...',
+                                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    if (_totalDeletingFiles > 0)
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xFF76B900).withOpacity(0.15),
+                                          borderRadius: BorderRadius.circular(4),
+                                          border: Border.all(color: const Color(0xFF76B900).withOpacity(0.4), width: 0.8),
+                                        ),
+                                        child: Text(
+                                          '${((_currentDeletedCount / _totalDeletingFiles) * 100).toInt()}%',
+                                          style: const TextStyle(
+                                            fontSize: 10,
+                                            fontWeight: FontWeight.bold,
+                                            color: Color(0xFF76B900),
+                                            fontFamily: 'monospace',
+                                          ),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                                if (_currentDeletingFileName.isNotEmpty) ...[
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    _currentDeletingFileName,
+                                    style: const TextStyle(fontSize: 11, color: Colors.white60, fontFamily: 'monospace'),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ],
+                              ],
                             ),
                           ),
+                          const SizedBox(width: 12),
                           const SizedBox(
                             width: 14,
                             height: 14,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                            child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF76B900)),
                           ),
                         ],
                       ),

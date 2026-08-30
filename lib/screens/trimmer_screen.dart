@@ -77,19 +77,22 @@ class _TrimmerScreenState extends State<TrimmerScreen> {
     });
 
     if (mounted) {
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.clearSnackBars();
       if (outputPath != null) {
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           SnackBar(
             content: Text('Export successful! Saved at: $outputPath'),
             backgroundColor: Colors.green,
-            duration: const Duration(seconds: 5),
+            duration: const Duration(seconds: 3),
           ),
         );
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           const SnackBar(
             content: Text('Failed to export video. Check logs.'),
             backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
           ),
         );
       }

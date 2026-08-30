@@ -25,7 +25,9 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
+        final messenger = ScaffoldMessenger.of(context);
+        messenger.clearSnackBars();
+        messenger.showSnackBar(
           SnackBar(content: Text('Failed to open file picker: $e')),
         );
       }
@@ -57,7 +59,9 @@ class _HomeScreenState extends State<HomeScreen> {
               if (file.path.endsWith('.mp4') || file.path.endsWith('.mkv') || file.path.endsWith('.avi')) {
                 _navigateToTrimmer(file.path);
               } else {
-                ScaffoldMessenger.of(context).showSnackBar(
+                final messenger = ScaffoldMessenger.of(context);
+                messenger.clearSnackBars();
+                messenger.showSnackBar(
                   const SnackBar(content: Text('Please select a valid video file (.mp4, .mkv, .avi)')),
                 );
               }

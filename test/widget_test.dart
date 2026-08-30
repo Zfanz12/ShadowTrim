@@ -1,30 +1,45 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-import 'package:flutter/material.dart';
+import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
-
-import 'package:shadowclip_trimmer/main.dart';
+import 'package:shadowclip_trimmer/services/native_core_bridge.dart';
+import 'package:shadowclip_trimmer/services/video_service.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const ShadowClipApp());
+  test('Native Core Bridge initialization and version check', () {
+    expect(ShadowTrimNativeBridge.isAvailable, isTrue);
+    expect(ShadowTrimNativeBridge.version, equals(100));
+  });
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+  test('Native C++ Win32 timestamp restoration works accurately', () async {
+    final tempDir = Directory.systemTemp.createTempSync('shadowtrim_test_');
+    final srcFile = File('${tempDir.path}\\src.txt')..writeAsStringSync('source content');
+    final dstFile = File('${tempDir.path}\\dst.txt')..writeAsStringSync('target content');
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
+    // Artificially change src time to 1 day ago
+    final pastTime = DateTime.now().subtract(const Duration(days: 1));
+    await srcFile.setLastModified(pastTime);
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    final success = ShadowTrimNativeBridge.restoreTimestampsNative(srcFile.path, dstFile.path);
+    expect(success, isTrue);
+
+    final dstStat = dstFile.statSync();
+    expect(dstStat.modified.difference(pastTime).inSeconds.abs(), lessThanOrEqualTo(2));
+
+    tempDir.deleteSync(recursive: true);
+  });
+
+  test('Native C++ Win32 recycleFileNative moves file to recycle bin safely', () {
+    final tempDir = Directory.systemTemp.createTempSync('shadowtrim_recycle_test_');
+    final dummyFile = File('${tempDir.path}\\dummy_to_recycle.txt')..writeAsStringSync('sample content');
+    expect(dummyFile.existsSync(), isTrue);
+
+    final success = ShadowTrimNativeBridge.recycleFileNative(dummyFile.path);
+    expect(success, isTrue);
+    expect(dummyFile.existsSync(), isFalse);
+
+    tempDir.deleteSync(recursive: true);
+  });
+
+  test('VideoTrimmer thumbnail queue clears cleanly', () {
+    expect(() => VideoTrimmer.clearThumbnailQueue(), returnsNormally);
   });
 }
