@@ -180,6 +180,7 @@ class ShadowTrimNativeBridge {
 
   /// Executes a process natively via Win32 `CreateProcessW` with HIGH_PRIORITY_CLASS
   /// without spawning command shells or interpreter subprocesses.
+  /// Runs in a background isolate to avoid blocking the UI thread during WaitForSingleObject.
   static Future<Map<String, dynamic>?> executeProcessNative(
     String executablePath,
     List<String> arguments, {
@@ -194,6 +195,24 @@ class ShadowTrimNativeBridge {
       return a;
     }).join(' ');
 
+    // Run blocking FFI call in a separate isolate to keep the UI thread responsive
+    try {
+      final result = await _runBlockingProcess(executablePath, argsString, bufferSize);
+      return result;
+    } catch (e, stack) {
+      LoggerService.logError('FFI executeProcess error: $e', stack);
+      return null;
+    }
+  }
+
+  /// Internal helper: runs the blocking C++ CreateProcessW + WaitForSingleObject
+  /// call using the process-level FFI bindings. Since DynamicLibrary lookups are
+  /// process-wide, we can call from any isolate.
+  static Map<String, dynamic>? _runBlockingProcess(
+    String executablePath,
+    String argsString,
+    int bufferSize,
+  ) {
     return using((arena) {
       try {
         final exePtr = executablePath.toNativeUtf8(allocator: arena);
@@ -219,7 +238,7 @@ class ShadowTrimNativeBridge {
           };
         }
       } catch (e, stack) {
-        LoggerService.logError('FFI executeProcess error: $e', stack);
+        LoggerService.logError('FFI executeProcess internal error: $e', stack);
       }
       return null;
     });

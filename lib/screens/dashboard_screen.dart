@@ -25,7 +25,7 @@ class DashboardScreen extends StatefulWidget {
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingObserver {
+class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingObserver, TickerProviderStateMixin {
   // Tabs
   bool _isFolderMode = false;
   bool _deleteOriginalAfterTrim = false;
@@ -83,6 +83,24 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   final Map<VideoClip, GlobalKey> _clipKeys = {};
   final Set<String> _probingPaths = {};
 
+  // P2-2: Store player stream subscriptions for clean disposal
+  final List<StreamSubscription> _playerSubscriptions = [];
+
+  // Toast Notification State
+  String? _toastMessage;
+  bool _isToastError = false;
+  bool _isToastDelete = false;
+  late final AnimationController _toastAnimController;
+  late final Animation<Offset> _toastSlideAnim;
+  late final Animation<double> _toastFadeAnim;
+  Timer? _toastDismissTimer;
+
+  int _getFirstUntrimmedIndex() {
+    final untrimmedIndex = _clips.indexWhere((c) => !c.isTrimmed);
+    if (untrimmedIndex != -1) return untrimmedIndex;
+    return _clips.isNotEmpty ? 0 : -1;
+  }
+
   void _probeClipMetadata(VideoClip clip) {
     final targetPath = (clip.isTrimmed && clip.trimmedOutputPath != null)
         ? clip.trimmedOutputPath!
@@ -123,6 +141,31 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     _exportNameFocusNode = FocusNode();
     _initPlayer();
 
+    // Toast Notification Animation Setup
+    _toastAnimController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 300),
+      reverseDuration: const Duration(milliseconds: 250),
+    );
+
+    _toastSlideAnim = Tween<Offset>(
+      begin: const Offset(0.0, 0.7),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(
+      parent: _toastAnimController,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    ));
+
+    _toastFadeAnim = Tween<double>(
+      begin: 0.0,
+      end: 1.0,
+    ).animate(CurvedAnimation(
+      parent: _toastAnimController,
+      curve: Curves.easeOut,
+      reverseCurve: Curves.easeIn,
+    ));
+
     // Load last session pointer so we can show "Continue" button
     _loadLastSessionPointer();
 
@@ -147,59 +190,75 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       debugPrint('mpv property configuration note: $e');
     }
 
-    // Listen to internal player errors
-    _player.stream.error.listen((err) {
-      LoggerService.logError('MediaKit Player Stream Error: $err');
-    });
+    // P2-2: Store subscriptions so they can be cancelled in dispose()
+    _playerSubscriptions.add(
+      _player.stream.error.listen((err) {
+        LoggerService.logError('MediaKit Player Stream Error: $err');
+      }),
+    );
 
-    // Track volume position
-    _player.stream.volume.listen((vol) {
-      if (mounted) {
-        setState(() {
-          _volume = vol;
-        });
-      }
-    });
-
-    // Track buffering state
-    _player.stream.buffering.listen((buffering) {
-      if (mounted) {
-        setState(() {
-          _isPlayerBuffering = buffering;
-          if (!buffering) _isClipLoading = false;
-        });
-      }
-    });
-
-    // Track playhead position
-    _player.stream.position.listen((pos) {
-      if (mounted) {
-        setState(() {
-          _currentPosition = pos;
-          if (_isClipLoading && pos > Duration.zero) {
-            _isClipLoading = false;
-          }
-        });
-      }
-    });
-
-    // Automatically update duration when video is loaded
-    _player.stream.duration.listen((duration) {
-      if (duration != null && duration > Duration.zero && _selectedClipIndex != -1) {
-        final currentClip = _clips[_selectedClipIndex];
-        if (!_viewingTrimmedMode && currentClip.duration == Duration.zero) {
+    _playerSubscriptions.add(
+      _player.stream.volume.listen((vol) {
+        if (mounted) {
           setState(() {
-            currentClip.duration = duration;
-            currentClip.endCut = duration;
+            _volume = vol;
           });
         }
-      }
-    });
+      }),
+    );
+
+    _playerSubscriptions.add(
+      _player.stream.buffering.listen((buffering) {
+        if (mounted) {
+          setState(() {
+            _isPlayerBuffering = buffering;
+            if (!buffering) _isClipLoading = false;
+          });
+        }
+      }),
+    );
+
+    _playerSubscriptions.add(
+      _player.stream.position.listen((pos) {
+        if (mounted) {
+          setState(() {
+            _currentPosition = pos;
+            if (_isClipLoading && pos > Duration.zero) {
+              _isClipLoading = false;
+            }
+          });
+        }
+      }),
+    );
+
+    // P1-3: Added bounds check (_selectedClipIndex < _clips.length)
+    // to prevent RangeError when clips are cleared while stream events are in-flight
+    _playerSubscriptions.add(
+      _player.stream.duration.listen((duration) {
+        if (duration != null && duration > Duration.zero &&
+            _selectedClipIndex >= 0 && _selectedClipIndex < _clips.length) {
+          final currentClip = _clips[_selectedClipIndex];
+          if (!_viewingTrimmedMode && currentClip.duration == Duration.zero) {
+            setState(() {
+              currentClip.duration = duration;
+              currentClip.endCut = duration;
+            });
+          }
+        }
+      }),
+    );
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    // P2-2: Cancel all player stream subscriptions before disposing player
+    for (final sub in _playerSubscriptions) {
+      sub.cancel();
+    }
+    _playerSubscriptions.clear();
+    _toastDismissTimer?.cancel();
+    _toastAnimController.dispose();
     _player.dispose();
     _exportNameController.dispose();
     _focusNode.dispose();
@@ -395,7 +454,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
         final firstPath = validFilePaths.first;
         _currentWorkspacePath = path.dirname(firstPath);
-        await _loadSessionBlacklist();
 
         LoggerService.logInfo('Importing ${validFilePaths.length} files from workspace: $_currentWorkspacePath');
 
@@ -420,7 +478,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           _sortClips();
         });
         if (_clips.isNotEmpty) {
-          await _selectClip(0);
+          final targetIndex = _getFirstUntrimmedIndex();
+          if (targetIndex != -1) {
+            await _selectClip(targetIndex);
+          }
         }
       }
     } catch (e, stack) {
@@ -461,8 +522,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
         _currentWorkspacePath = directoryPath;
         LoggerService.logInfo('Opening workspace folder: $directoryPath');
-
-        await _loadSessionBlacklist();
 
         final dir = Directory(directoryPath);
         final List<String> validFilePaths = [];
@@ -515,7 +574,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           _sortClips();
         });
         if (_clips.isNotEmpty) {
-          await _selectClip(0);
+          final targetIndex = _getFirstUntrimmedIndex();
+          if (targetIndex != -1) {
+            await _selectClip(targetIndex);
+          }
         }
       }
     } catch (e, stack) {
@@ -541,12 +603,31 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     await Future.delayed(const Duration(milliseconds: 50));
 
     try {
-      if (filePaths.isNotEmpty) {
-        _currentWorkspacePath = path.dirname(filePaths.first);
-        await _loadSessionBlacklist();
+      // P1-2: Expand directories — if a dropped path is a folder, scan it for video files
+      final List<String> expandedPaths = [];
+      for (final fp in filePaths) {
+        if (FileSystemEntity.isDirectorySync(fp)) {
+          try {
+            final dir = Directory(fp);
+            await for (final entity in dir.list(followLinks: false)) {
+              if (entity is File) {
+                final ext = path.extension(entity.path).toLowerCase();
+                if (['.mp4', '.mkv', '.avi', '.mov'].contains(ext)) {
+                  expandedPaths.add(entity.path);
+                }
+              }
+            }
+          } catch (_) {}
+        } else {
+          expandedPaths.add(fp);
+        }
       }
 
-      final validPaths = filePaths.where((fp) {
+      if (expandedPaths.isNotEmpty) {
+        _currentWorkspacePath = path.dirname(expandedPaths.first);
+      }
+
+      final validPaths = expandedPaths.where((fp) {
         final ext = path.extension(fp).toLowerCase();
         return ['.mp4', '.mkv', '.avi', '.mov'].contains(ext);
       }).toList();
@@ -577,7 +658,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           _sortClips();
         });
         if (_clips.isNotEmpty) {
-          await _selectClip(0);
+          final targetIndex = _getFirstUntrimmedIndex();
+          if (targetIndex != -1) {
+            await _selectClip(targetIndex);
+          }
         }
       } else {
         _showSnackBar('No valid video files dropped.', isError: true);
@@ -629,19 +713,129 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     return "${twoDigits(duration.inHours)}:$twoDigitMinutes:$twoDigitSeconds.$milliseconds";
   }
 
-  void _showSnackBar(String message, {bool isError = false, bool isDelete = false}) {
+  void _showSnackBar(String message, {bool isError = false, bool isDelete = false, Duration duration = const Duration(seconds: 3)}) {
     if (!mounted) return;
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.clearSnackBars();
-    messenger.showSnackBar(
-      SnackBar(
-        content: Text(
-          message,
-          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+
+    _toastDismissTimer?.cancel();
+
+    setState(() {
+      _toastMessage = message;
+      _isToastError = isError;
+      _isToastDelete = isDelete;
+    });
+
+    _toastAnimController.forward(from: 0.0);
+
+    _toastDismissTimer = Timer(duration, () {
+      _dismissToast();
+    });
+  }
+
+  void _dismissToast() {
+    _toastDismissTimer?.cancel();
+    if (mounted && _toastMessage != null) {
+      _toastAnimController.reverse().then((_) {
+        if (mounted && _toastAnimController.isDismissed) {
+          setState(() {
+            _toastMessage = null;
+          });
+        }
+      });
+    }
+  }
+
+  Widget _buildToastNotification() {
+    if (_toastMessage == null) return const SizedBox.shrink();
+
+    final Color accentColor = (_isToastError || _isToastDelete)
+        ? const Color(0xFFEF4444)
+        : const Color(0xFF76B900);
+
+    final IconData icon = _isToastError
+        ? Icons.error_outline_rounded
+        : (_isToastDelete ? Icons.delete_outline_rounded : Icons.check_circle_outline_rounded);
+
+    return Positioned(
+      bottom: _isEndingSession ? 84 : 24,
+      right: 28,
+      child: SlideTransition(
+        position: _toastSlideAnim,
+        child: FadeTransition(
+          opacity: _toastFadeAnim,
+          child: Material(
+            color: Colors.transparent,
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                onTap: _dismissToast,
+                child: Container(
+                  constraints: const BoxConstraints(maxWidth: 480, minWidth: 260),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF161622).withOpacity(0.96),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: accentColor.withOpacity(0.45),
+                      width: 1.2,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.55),
+                        blurRadius: 18,
+                        offset: const Offset(0, 6),
+                      ),
+                      BoxShadow(
+                        color: accentColor.withOpacity(0.15),
+                        blurRadius: 12,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: accentColor.withOpacity(0.15),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Icon(icon, color: accentColor, size: 18),
+                      ),
+                      const SizedBox(width: 12),
+                      Flexible(
+                        child: Text(
+                          _toastMessage!,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.2,
+                          ),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      InkWell(
+                        onTap: _dismissToast,
+                        borderRadius: BorderRadius.circular(6),
+                        child: Padding(
+                          padding: const EdgeInsets.all(4),
+                          child: Icon(
+                            Icons.close_rounded,
+                            size: 16,
+                            color: Colors.grey.shade400,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
         ),
-        backgroundColor: (isError || isDelete) ? Colors.red.shade800 : Colors.green.shade800,
-        duration: const Duration(seconds: 3),
-        behavior: SnackBarBehavior.floating,
       ),
     );
   }
@@ -728,52 +922,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     }
   }
 
-  Future<File> _getBlacklistFile() async {
+  Future<File> _getLegacyBlacklistFile() async {
     if (_currentWorkspacePath != null) {
       return File(path.join(_currentWorkspacePath!, '.shadowtrim_blacklist.json'));
     }
     final docDir = await getApplicationDocumentsDirectory();
     return File(path.join(docDir.path, 'shadowtrim_global_blacklist.json'));
-  }
-
-  Future<void> _saveSessionBlacklist() async {
-    try {
-      final file = await _getBlacklistFile();
-      final jsonString = jsonEncode(_blacklistedClipNames.toList());
-      await file.writeAsString(jsonString);
-    } catch (e) {
-      debugPrint('Failed to save blacklist: $e');
-    }
-  }
-
-  Future<void> _deleteSessionBlacklist() async {
-    try {
-      final file = await _getBlacklistFile();
-      if (await file.exists()) {
-        await file.delete();
-      }
-      setState(() {
-        _blacklistedClipNames.clear();
-      });
-    } catch (e) {
-      debugPrint('Failed to delete blacklist: $e');
-    }
-  }
-
-  Future<void> _loadSessionBlacklist() async {
-    try {
-      final file = await _getBlacklistFile();
-      if (await file.exists()) {
-        final content = await file.readAsString();
-        final List<dynamic> list = jsonDecode(content);
-        setState(() {
-          _blacklistedClipNames.clear();
-          _blacklistedClipNames.addAll(list.cast<String>());
-        });
-      }
-    } catch (e) {
-      debugPrint('Failed to load blacklist: $e');
-    }
   }
 
   Future<String?> _showSessionSavePrompt() async {
@@ -1145,11 +1299,21 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         'originalFileName': c.originalFileName,
       }).toList();
       await file.writeAsString(jsonEncode({
+        'version': 2,
         'clips': clipData,
         'deletedClips': deletedData,
         'originalClipsToDelete': _originalClipsToDelete.toList(),
+        'blacklistedClips': _blacklistedClipNames.toList(),
       }));
       await _saveLastSessionPointer();
+
+      // Clean up legacy blacklist file if it still exists
+      final legacy = await _getLegacyBlacklistFile();
+      if (await legacy.exists()) {
+        try {
+          await legacy.delete();
+        } catch (_) {}
+      }
     } catch (e) {
       debugPrint('Failed to save session data: $e');
     }
@@ -1158,12 +1322,22 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   Future<void> _restoreSessionData() async {
     try {
       final file = await _getSessionFile();
-      if (!await file.exists()) return;
-      final content = await file.readAsString();
-      final Map<String, dynamic> json = jsonDecode(content);
+      final legacyFile = await _getLegacyBlacklistFile();
+      
+      // If neither session file nor legacy blacklist file exists, return
+      if (!await file.exists() && !await legacyFile.exists()) return;
+
+      Map<String, dynamic> json = {};
+      if (await file.exists()) {
+        final content = await file.readAsString();
+        json = jsonDecode(content);
+      }
+
       final List<dynamic> savedClips = json['clips'] ?? [];
       final List<dynamic> savedDeleted = json['deletedClips'] ?? [];
       final List<dynamic> savedToDelete = json['originalClipsToDelete'] ?? [];
+      final List<dynamic> savedBlacklist = json['blacklistedClips'] ?? [];
+
       final Map<String, Map<String, dynamic>> byPath = {
         for (final c in savedClips) (c['filePath'] as String): c as Map<String, dynamic>
       };
@@ -1184,7 +1358,22 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           ));
         }
       }
+
+      // Check legacy blacklist file for migration
+      final Set<String> migratedBlacklist = savedBlacklist.cast<String>().toSet();
+      if (await legacyFile.exists()) {
+        try {
+          final legacyContent = await legacyFile.readAsString();
+          final List<dynamic> legacyList = jsonDecode(legacyContent);
+          migratedBlacklist.addAll(legacyList.cast<String>());
+          await legacyFile.delete();
+        } catch (_) {}
+      }
+
       setState(() {
+        _blacklistedClipNames.clear();
+        _blacklistedClipNames.addAll(migratedBlacklist);
+
         for (final clip in _clips) {
           final saved = byPath[clip.filePath];
           if (saved != null) {
@@ -1199,6 +1388,9 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         }
         _deletedClips = restoredDeleted;
         _originalClipsToDelete.addAll(savedToDelete.cast<String>());
+        // P0-3: Remove ghost clips — clips that are in _deletedClips should not appear in _clips
+        final deletedPaths = restoredDeleted.map((d) => d.filePath).toSet();
+        _clips.removeWhere((clip) => deletedPaths.contains(clip.filePath));
       });
     } catch (e) {
       debugPrint('Failed to restore session data: $e');
@@ -1212,6 +1404,15 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       // Also remove the last session pointer
       final ptr = await _getLastSessionPointerFile();
       if (await ptr.exists()) await ptr.delete();
+      // Delete legacy blacklist file if present
+      final legacy = await _getLegacyBlacklistFile();
+      if (await legacy.exists()) await legacy.delete();
+
+      if (mounted) {
+        setState(() {
+          _blacklistedClipNames.clear();
+        });
+      }
     } catch (e) {
       debugPrint('Failed to delete session data: $e');
     }
@@ -1220,7 +1421,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   /// Restores a session from a given workspace path (for "Continue" button)
   Future<void> _continueLastSession(String workspacePath) async {
     _currentWorkspacePath = workspacePath;
-    await _loadSessionBlacklist();
     final sessionFile = File(path.join(workspacePath, '.shadowtrim_session.json'));
     if (!await sessionFile.exists()) return;
     final content = await sessionFile.readAsString();
@@ -1228,6 +1428,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     final List<dynamic> savedClips = json['clips'] ?? [];
     final List<dynamic> savedDeleted = json['deletedClips'] ?? [];
     final List<dynamic> savedToDelete = json['originalClipsToDelete'] ?? [];
+    final List<dynamic> savedBlacklist = json['blacklistedClips'] ?? [];
 
     final List<VideoClip> restoredClips = [];
     for (final c in savedClips) {
@@ -1262,9 +1463,16 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       _clips = restoredClips;
       _deletedClips = restoredDeleted;
       _originalClipsToDelete.addAll(savedToDelete.cast<String>());
+      _blacklistedClipNames.clear();
+      _blacklistedClipNames.addAll(savedBlacklist.cast<String>());
       _lastSessionWorkspacePath = null;
       _sortClips();
-      if (_clips.isNotEmpty) _selectClip(0);
+      if (_clips.isNotEmpty) {
+        final targetIndex = _getFirstUntrimmedIndex();
+        if (targetIndex != -1) {
+          _selectClip(targetIndex);
+        }
+      }
     });
   }
 
@@ -1389,7 +1597,13 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
 
     if (confirmed == true) {
-      final totalCount = _deletedClips.length + _originalClipsToDelete.length;
+      // P1-5: Deduplicate file paths to avoid double-counting
+      final allPathsToDelete = <String>{
+        ..._deletedClips.map((c) => c.filePath),
+        ..._originalClipsToDelete,
+      };
+      final totalCount = allPathsToDelete.length;
+      final processedPaths = <String>{};
       setState(() {
         _isEndingSession = true;
         _totalDeletingFiles = totalCount;
@@ -1404,6 +1618,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         // Delete clips flagged via "Delete Clip" button
         for (final clip in List<VideoClip>.from(_deletedClips)) {
           if (!mounted) break;
+          if (processedPaths.contains(clip.filePath)) continue;
+          processedPaths.add(clip.filePath);
           setState(() {
             _currentDeletingFileName = clip.fileName;
           });
@@ -1418,6 +1634,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         // Delete clips flagged via "Delete original clip after trim"
         for (final filePath in List<String>.from(_originalClipsToDelete)) {
           if (!mounted) break;
+          if (processedPaths.contains(filePath)) continue;
+          processedPaths.add(filePath);
           setState(() {
             _currentDeletingFileName = path.basename(filePath);
           });
@@ -1430,7 +1648,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         }
         _originalClipsToDelete.clear();
 
-        await _deleteSessionBlacklist();
         await _deleteSessionData();
 
         if (mounted) {
@@ -1478,10 +1695,15 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           setState(() => _isExiting = true);
           // Save session WITHOUT executing deletions — they only run on End Session
           await _saveSessionData();
-          await _saveSessionBlacklist();
           return AppExitResponse.exit;
         } else if (result == 'delete') {
-          final totalCount = _deletedClips.length + _originalClipsToDelete.length;
+          // P1-5: Deduplicate file paths to avoid double-counting
+          final allPathsToDelete = <String>{
+            ..._deletedClips.map((c) => c.filePath),
+            ..._originalClipsToDelete,
+          };
+          final totalCount = allPathsToDelete.length;
+          final processedPaths = <String>{};
           setState(() {
             _isExiting = true;
             _isEndingSession = true;
@@ -1496,6 +1718,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           // End This Session — execute all pending deletions with progress
           for (final clip in List<VideoClip>.from(_deletedClips)) {
             if (!mounted) break;
+            if (processedPaths.contains(clip.filePath)) continue;
+            processedPaths.add(clip.filePath);
             setState(() {
               _currentDeletingFileName = clip.fileName;
             });
@@ -1509,6 +1733,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
           for (final filePath in List<String>.from(_originalClipsToDelete)) {
             if (!mounted) break;
+            if (processedPaths.contains(filePath)) continue;
+            processedPaths.add(filePath);
             setState(() {
               _currentDeletingFileName = path.basename(filePath);
             });
@@ -1521,7 +1747,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           }
           _originalClipsToDelete.clear();
 
-          await _deleteSessionBlacklist();
           await _deleteSessionData();
           return AppExitResponse.exit;
         } else {
@@ -1730,6 +1955,15 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
     final String? oldTrimmedPath = clip.isTrimmed ? clip.trimmedOutputPath : null;
 
+    // P1-4: Release player file lock if the player is currently playing the file
+    // that will be overwritten, to prevent Windows sharing violation
+    if (oldTrimmedPath != null && _currentlyLoadedMediaUrl == oldTrimmedPath) {
+      try {
+        await _player.stop();
+        _currentlyLoadedMediaUrl = null;
+      } catch (_) {}
+    }
+
     try {
       // Time parameters formatted as HH:MM:SS.xxx
       final startTimeStr = _formatDuration(clip.startCut);
@@ -1748,7 +1982,14 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         if (await customFile.exists()) {
           await customFile.delete();
         }
-        await defaultFile.rename(customOutputPath);
+        // P0-2: Safe cross-drive move — try rename first, fallback to copy+delete
+        try {
+          await defaultFile.rename(customOutputPath);
+        } catch (_) {
+          // rename fails across drive boundaries (errno 17), use copy+delete
+          await defaultFile.copy(customOutputPath);
+          await defaultFile.delete();
+        }
       }
 
       if (result != null) {
@@ -1843,141 +2084,143 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         },
         onDragEntered: (detail) => setState(() => _isDragging = true),
         onDragExited: (detail) => setState(() => _isDragging = false),
-        child: Column(
+        child: Stack(
           children: [
-            // Top Bar
-            _buildTopBar(),
-            if (_isEndingSession)
-              const LinearProgressIndicator(
-                minHeight: 3,
-                color: Colors.white,
-                backgroundColor: Color(0xFF1E1E2E),
-              ),
-            const Divider(height: 1, color: Color(0xFF1E1E2E)),
-            
-            // Main Content Area
-            Expanded(
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // Left Column: Workspaces & Clips (width: 300)
-                  _buildLeftSidebar(),
-                  const VerticalDivider(width: 1, color: Color(0xFF1E1E2E)),
-                  
-                  // Middle Column: Large Video Preview & Controls (flexible)
-                  Expanded(
-                    flex: 5,
-                    child: _buildCenterPlayer(activeClip),
+            Column(
+              children: [
+                // Top Bar
+                _buildTopBar(),
+                // P2-5: Removed duplicate LinearProgressIndicator — the bottom bar already has one
+                const Divider(height: 1, color: Color(0xFF1E1E2E)),
+                
+                // Main Content Area
+                Expanded(
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // Left Column: Workspaces & Clips (width: 300)
+                      _buildLeftSidebar(),
+                      const VerticalDivider(width: 1, color: Color(0xFF1E1E2E)),
+                      
+                      // Middle Column: Large Video Preview & Controls (flexible)
+                      Expanded(
+                        flex: 5,
+                        child: _buildCenterPlayer(activeClip),
+                      ),
+                      const VerticalDivider(width: 1, color: Color(0xFF1E1E2E)),
+                      
+                      // Right Column: Small Settings & Export (width: 260)
+                      _buildRightSettings(activeClip),
+                    ],
                   ),
-                  const VerticalDivider(width: 1, color: Color(0xFF1E1E2E)),
-                  
-                  // Right Column: Small Settings & Export (width: 260)
-                  _buildRightSettings(activeClip),
-                ],
-              ),
-            ),
-
-            // Bottom Deletion Progress Bar
-            if (_isEndingSession)
-              Container(
-                decoration: BoxDecoration(
-                  color: const Color(0xFF130E14),
-                  border: Border(
-                    top: BorderSide(
-                      color: Colors.redAccent.withOpacity(0.35),
-                      width: 1,
-                    ),
-                  ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.5),
-                      blurRadius: 8,
-                      offset: const Offset(0, -2),
-                    ),
-                  ],
                 ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    LinearProgressIndicator(
-                      minHeight: 4,
-                      value: _totalDeletingFiles > 0
-                          ? (_currentDeletedCount / _totalDeletingFiles).clamp(0.0, 1.0)
-                          : null,
-                      valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF76B900)),
-                      backgroundColor: const Color(0xFF1E1E2E),
+
+                // Bottom Deletion Progress Bar
+                if (_isEndingSession)
+                  Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF130E14),
+                      border: Border(
+                        top: BorderSide(
+                          color: Colors.redAccent.withOpacity(0.35),
+                          width: 1,
+                        ),
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.5),
+                          blurRadius: 8,
+                          offset: const Offset(0, -2),
+                        ),
+                      ],
                     ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                      child: Row(
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.all(6),
-                            decoration: BoxDecoration(
-                              color: Colors.redAccent.withOpacity(0.15),
-                              borderRadius: BorderRadius.circular(6),
-                            ),
-                            child: const Icon(Icons.delete_sweep_outlined, size: 16, color: Colors.redAccent),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Row(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        LinearProgressIndicator(
+                          minHeight: 4,
+                          value: _totalDeletingFiles > 0
+                              ? (_currentDeletedCount / _totalDeletingFiles).clamp(0.0, 1.0)
+                              : null,
+                          valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF76B900)),
+                          backgroundColor: const Color(0xFF1E1E2E),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                          child: Row(
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.all(6),
+                                decoration: BoxDecoration(
+                                  color: Colors.redAccent.withOpacity(0.15),
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: const Icon(Icons.delete_sweep_outlined, size: 16, color: Colors.redAccent),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
                                   children: [
-                                    Text(
-                                      _totalDeletingFiles > 0
-                                          ? 'Deleting session files: ($_currentDeletedCount/$_totalDeletingFiles) deleted'
-                                          : 'Cleaning up session files...',
-                                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    if (_totalDeletingFiles > 0)
-                                      Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                        decoration: BoxDecoration(
-                                          color: const Color(0xFF76B900).withOpacity(0.15),
-                                          borderRadius: BorderRadius.circular(4),
-                                          border: Border.all(color: const Color(0xFF76B900).withOpacity(0.4), width: 0.8),
+                                    Row(
+                                      children: [
+                                        Text(
+                                          _totalDeletingFiles > 0
+                                              ? 'Deleting session files: ($_currentDeletedCount/$_totalDeletingFiles) deleted'
+                                              : 'Cleaning up session files...',
+                                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white),
                                         ),
-                                        child: Text(
-                                          '${((_currentDeletedCount / _totalDeletingFiles) * 100).toInt()}%',
-                                          style: const TextStyle(
-                                            fontSize: 10,
-                                            fontWeight: FontWeight.bold,
-                                            color: Color(0xFF76B900),
-                                            fontFamily: 'monospace',
+                                        const SizedBox(width: 8),
+                                        if (_totalDeletingFiles > 0)
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0xFF76B900).withOpacity(0.15),
+                                              borderRadius: BorderRadius.circular(4),
+                                              border: Border.all(color: const Color(0xFF76B900).withOpacity(0.4), width: 0.8),
+                                            ),
+                                            child: Text(
+                                              '${((_currentDeletedCount / _totalDeletingFiles) * 100).toInt()}%',
+                                              style: const TextStyle(
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.bold,
+                                                color: Color(0xFF76B900),
+                                                fontFamily: 'monospace',
+                                              ),
+                                            ),
                                           ),
-                                        ),
+                                      ],
+                                    ),
+                                    if (_currentDeletingFileName.isNotEmpty) ...[
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        _currentDeletingFileName,
+                                        style: const TextStyle(fontSize: 11, color: Colors.white60, fontFamily: 'monospace'),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
                                       ),
+                                    ],
                                   ],
                                 ),
-                                if (_currentDeletingFileName.isNotEmpty) ...[
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    _currentDeletingFileName,
-                                    style: const TextStyle(fontSize: 11, color: Colors.white60, fontFamily: 'monospace'),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ],
-                              ],
-                            ),
+                              ),
+                              const SizedBox(width: 12),
+                              const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF76B900)),
+                              ),
+                            ],
                           ),
-                          const SizedBox(width: 12),
-                          const SizedBox(
-                            width: 14,
-                            height: 14,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF76B900)),
-                          ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
-              ),
+                  ),
+              ],
+            ),
+
+            // Toast Floating Notification
+            _buildToastNotification(),
           ],
         ),
       ),
@@ -2411,9 +2654,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   }
 
   Widget _buildClipTile(VideoClip clip) {
-    if (clip.duration == Duration.zero) {
-      _probeClipMetadata(clip);
-    }
+    // P1-1: Removed _probeClipMetadata call from build pass — probing is already
+    // triggered by _selectClip and during initial import, not during every rebuild.
 
     final int idx = _clips.indexOf(clip);
     final isSelected = idx == _selectedClipIndex;
@@ -2560,7 +2802,9 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          if (clip.isTrimmed && File(clip.filePath).existsSync()) ...[
+                          // P2-4: Avoid sync disk I/O in build — the original file is available for edit
+                          // if it's not flagged for deletion (checked in _originalClipsToDelete set)
+                          if (clip.isTrimmed && !_originalClipsToDelete.contains(clip.filePath)) ...[
                             IconButton(
                               icon: const Icon(Icons.edit, size: 14, color: Color(0xFF76B900)),
                               tooltip: 'Edit / Revise',
